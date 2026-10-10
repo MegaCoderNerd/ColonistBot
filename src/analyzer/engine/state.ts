@@ -334,6 +334,8 @@ export interface ConcreteSimulatedGameState {
   turnPlayerIndex: number;
   phase: ConcreteTurnPhase;
   completedTurns: number;
+  /** During setup_road, records the corner index of the settlement just placed in setup_settlement. */
+  pendingSetupCornerIndex?: number;
   dice: { thrown: boolean; d1?: number; d2?: number; total?: number };
   rules: {
     victoryPointsToWin: number;
@@ -341,6 +343,15 @@ export interface ConcreteSimulatedGameState {
     friendlyRobber: boolean;
     friendlyRobberMinVisibleVp: number;
     diceMode: "balanced" | "random";
+    maxPlayers?: number;
+    bankResourceCap?: number;
+    maxSettlementsPerPlayer?: number;
+    maxCitiesPerPlayer?: number;
+    maxRoadsPerPlayer?: number;
+    devDeckComposition?: Readonly<Record<ConcreteDevCardKind, number>>;
+    specialBuildingPhase?: boolean;
+    extensionSetting?: number;
+    mapSetting?: number;
   };
   winnerId?: string;
 }
@@ -507,6 +518,7 @@ export function buildObservedGameState(input: ObservedStateInput): ObservedGameS
     }
   };
   for (const p of input.players ?? []) addPlayerId(p.id, { name: p.name, color: p.color });
+  for (const pid of input.snapshot?.playOrder ?? []) addPlayerId(pid);
   for (const p of input.snapshot?.players ?? []) addPlayerId(p.id);
   addPlayerId(input.selfId);
   for (const [, owner] of input.placements.settlements) addPlayerId(owner);
@@ -1419,6 +1431,31 @@ export function validateObservedState(state: ObservedGameState): StateValidation
   };
 }
 
+export function cloneConcreteSimState(state: ConcreteSimulatedGameState): ConcreteSimulatedGameState {
+  return {
+    ...state,
+    cornerOwner: [...state.cornerOwner],
+    cornerPiece: new Uint8Array(state.cornerPiece),
+    edgeOwner: [...state.edgeOwner],
+    bank: { ...state.bank },
+    devDeckOrder: [...state.devDeckOrder],
+    players: state.players.map((p) => ({
+      ...p,
+      hand: { ...p.hand },
+      ratios: { ...p.ratios },
+      readyDevs: [...p.readyDevs],
+      boughtDevsThisTurn: [...p.boughtDevsThisTurn],
+      playedDevs: [...p.playedDevs]
+    })),
+    ...(state.playerOrder ? { playerOrder: [...state.playerOrder] } : {}),
+    dice: { ...state.dice },
+    rules: {
+      ...state.rules,
+      ...(state.rules.devDeckComposition ? { devDeckComposition: { ...state.rules.devDeckComposition } } : {})
+    }
+  };
+}
+
 /**
  * Strict invariant validator for a fully determined `ConcreteSimulatedGameState`
  * (where all hidden cards and opponent resources have been sampled for a rollout trial).
@@ -1432,6 +1469,12 @@ export function validateConcreteSimState(state: ConcreteSimulatedGameState): Sta
   }
   if (state.turnPlayerIndex < 0 || state.turnPlayerIndex >= players.length) {
     errors.push(`Invalid turnPlayerIndex: ${state.turnPlayerIndex}`);
+  }
+  if (cornerOwner.length !== topology.corners.length || cornerPiece.length !== topology.corners.length) {
+    errors.push("Corner state array length mismatch with topology.");
+  }
+  if (edgeOwner.length !== topology.edges.length) {
+    errors.push("Edge state array length mismatch with topology.");
   }
 
   for (let ci = 0; ci < topology.corners.length; ci++) {
@@ -1452,13 +1495,14 @@ export function validateConcreteSimState(state: ConcreteSimulatedGameState): Sta
   if (players.filter((p) => p.hasLongestRoad).length > 1) errors.push("Simultaneous Longest Road holders.");
   if (players.filter((p) => p.hasLargestArmy).length > 1) errors.push("Simultaneous Largest Army holders.");
 
+  const resourceCap = state.rules.bankResourceCap ?? BANK_RESOURCE_CAP;
   for (const r of RESOURCES) {
     if (bank[r] < 0 || players.some((p) => p.hand[r] < 0)) {
       errors.push(`Negative resource count for ${r}.`);
     }
     const total = bank[r] + players.reduce((s, p) => s + p.hand[r], 0);
-    if (total !== BANK_RESOURCE_CAP) {
-      errors.push(`Strict resource conservation failed for ${r}: ${total} !== ${BANK_RESOURCE_CAP}`);
+    if (total !== resourceCap) {
+      errors.push(`Strict resource conservation failed for ${r}: ${total} !== ${resourceCap}`);
     }
   }
 
@@ -1466,16 +1510,28 @@ export function validateConcreteSimState(state: ConcreteSimulatedGameState): Sta
     if (p.actualSimulatedVp !== p.visibleVp + p.vpDevs) {
       errors.push(`Player ${p.id} actualSimulatedVp (${p.actualSimulatedVp}) !== visibleVp (${p.visibleVp}) + vpDevs (${p.vpDevs}).`);
     }
+    if (p.observedConfirmedVp < p.visibleVp) {
+      errors.push(`Player ${p.id} observedConfirmedVp (${p.observedConfirmedVp}) < visibleVp (${p.visibleVp}).`);
+    }
+    if (p.hasLongestRoad && p.roadLength < 5) {
+      errors.push(`Player ${p.id} holds Longest Road with roadLength=${p.roadLength} (< 5).`);
+    }
+    if (p.hasLargestArmy && p.knightsPlayed < 3) {
+      errors.push(`Player ${p.id} holds Largest Army with knightsPlayed=${p.knightsPlayed} (< 3).`);
+    }
   }
 
+  const expectedDevs = state.rules.devDeckComposition
+    ? Object.values(state.rules.devDeckComposition).reduce((a, b) => a + b, 0)
+    : 25;
   const totalDevs =
     state.devDeckOrder.length +
     players.reduce(
       (s, p) => s + p.readyDevs.length + p.boughtDevsThisTurn.length + p.vpDevs + p.playedDevs.length,
       0
     );
-  if (totalDevs !== 25) {
-    errors.push(`Strict 25-card dev deck conservation failed: total=${totalDevs} !== 25.`);
+  if (totalDevs !== expectedDevs) {
+    errors.push(`Strict ${expectedDevs}-card dev deck conservation failed: total=${totalDevs} !== ${expectedDevs}.`);
   }
 
   return {

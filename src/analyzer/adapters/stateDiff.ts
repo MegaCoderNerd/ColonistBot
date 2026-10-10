@@ -78,10 +78,18 @@ export function findStatePatch(value: unknown, depth = 0): Record<string, unknow
   if (!isObject(value)) return undefined;
   if (isObject(value.diff)) return value.diff;
   if (isObject(value.gameState)) {
-    return isObject(value.gameSettings) ? { ...value.gameState, gameSettings: value.gameSettings } : value.gameState;
+    return {
+      ...value.gameState,
+      ...(isObject(value.gameSettings) ? { gameSettings: value.gameSettings } : {}),
+      ...(Array.isArray(value.playOrder) ? { playOrder: value.playOrder } : {})
+    };
   }
   if (isObject(value.initialState)) {
-    return isObject(value.gameSettings) ? { ...value.initialState, gameSettings: value.gameSettings } : value.initialState;
+    return {
+      ...value.initialState,
+      ...(isObject(value.gameSettings) ? { gameSettings: value.gameSettings } : {}),
+      ...(Array.isArray(value.playOrder) ? { playOrder: value.playOrder } : {})
+    };
   }
   if (STATE_KEYS.some((k) => isObject(value[k]))) return value;
   for (const v of Object.values(value)) {
@@ -481,8 +489,13 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
   const dice = get(state, "diceState");
   const current = get(state, "currentState");
   const robber = num(get(state, "mechanicRobberState", "locationTileIndex"));
+  const rawPlayOrder = get(state, "playOrder");
+  const playOrder = Array.isArray(rawPlayOrder)
+    ? rawPlayOrder.map((c) => num(c)).filter((c): c is number => c !== undefined).map((c) => playerId(c))
+    : undefined;
   return {
     players,
+    ...(playOrder && playOrder.length > 0 ? { playOrder } : {}),
     bank: Object.keys(bank).length ? bank : undefined,
     bankDevsLeft,
     dice: isObject(dice) ? { thrown: dice.diceThrown === true, d1: num(dice.dice1), d2: num(dice.dice2) } : undefined,

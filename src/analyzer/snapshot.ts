@@ -56,6 +56,7 @@ export interface GameSettingsSnapshot {
 
 export interface GameSnapshot {
   players: PlayerSnapshot[];
+  playOrder?: string[];
   bank?: ResourceBag;
   bankDevsLeft?: number;
   dice?: { thrown: boolean; d1?: number; d2?: number };
@@ -66,4 +67,5 @@ export interface GameSnapshot {
   robberHex?: string;
   gameSettings?: GameSettingsSnapshot;
 }
+
 

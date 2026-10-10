@@ -16,11 +16,30 @@ import {
 import {
   buildObservedGameState,
   classifyTurnPhase,
+  cloneConcreteSimState,
   cloneObservedGameState,
   validateConcreteSimState,
   validateObservedState,
   type ConcreteSimulatedGameState
 } from "../src/analyzer/engine/state";
+import {
+  applyAction,
+  createInitialConcreteState,
+  getEligibleRobberVictims,
+  getLegalActions,
+  getLegalCityCorners,
+  getLegalRoadEdges,
+  getLegalRobberMoves,
+  getLegalSettlementCorners,
+  getLegalSetupRoadEdges,
+  getLegalSetupSettlementCorners,
+  isActionLegal,
+  materializeConcreteState,
+  updateLargestArmyAward,
+  updateLongestRoadAward,
+  type ActionOutcome,
+  type SimulatedAction
+} from "../src/analyzer/engine/transition";
 import type { Recording } from "../src/shared/schema";
 
 const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08.json";
@@ -592,4 +611,1071 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       );
     });
   });
+
+  describe("Stage 3.2 — Rule-Correct Shared-Board Legal-Action & State-Transition Engine", () => {
+    function getStandardTopology() {
+      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
+      return getBoardTopology(parsed.board!);
+    }
+
+    function snapshotStateForImmutability(state: ConcreteSimulatedGameState) {
+      return JSON.stringify({
+        ...state,
+        topology: undefined,
+        cornerPiece: Array.from(state.cornerPiece)
+      });
+    }
+
+    function expectRejectedUnchanged(
+      state: ConcreteSimulatedGameState,
+      playerId: string,
+      action: SimulatedAction,
+      expectedCode: string,
+      outcome?: ActionOutcome
+    ) {
+      const before = snapshotStateForImmutability(state);
+      const res = applyAction(state, playerId, action, outcome);
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error.code).toBe(expectedCode);
+      }
+      expect(snapshotStateForImmutability(state)).toBe(before);
+    }
+
+    function assertAllLegalActionsSucceed(
+      state: ConcreteSimulatedGameState,
+      playerId?: string,
+      includeDomesticTrades = false
+    ) {
+      const actions = getLegalActions(state, playerId, { includeDomesticTrades });
+      const effectivePlayerId =
+        playerId ??
+        (state.phase === "discard"
+          ? state.players.find((p) => p.pendingDiscardCount > 0)?.id ?? state.players[state.turnPlayerIndex].id
+          : state.players[state.turnPlayerIndex].id);
+
+      for (const action of actions) {
+        expect(isActionLegal(state, effectivePlayerId, action)).toBe(true);
+        let outcome: ActionOutcome | undefined;
+        if (action.type === "rollDice") {
+          outcome = { dice: { d1: 3, d2: 5, total: 8 } };
+        } else if (action.type === "moveRobber" && typeof action.victimId === "string") {
+          const victim = state.players.find((p) => p.id === action.victimId)!;
+          const res = (["lumber", "brick", "wool", "grain", "ore"] as const).find((r) => victim.hand[r] > 0)!;
+          outcome = { stolenResource: res };
+        }
+        const before = snapshotStateForImmutability(state);
+        const res = applyAction(state, effectivePlayerId, action, outcome);
+        expect(res.ok, !res.ok ? `${action.type}: ${res.error.code} - ${res.error.message}` : "").toBe(true);
+        expect(snapshotStateForImmutability(state)).toBe(before);
+        if (res.ok) {
+          const val = validateConcreteSimState(res.state);
+          expect(val.valid, val.errors.join("; ")).toBe(true);
+        }
+      }
+    }
+
+    it("1. Setup snake order, initial resource grant on 2nd settlement, setup road attachment, and farm9373 replay parity", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({
+        topology: topo,
+        playerIds: ["c1", "c5"]
+      });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+
+      expect(state.phase).toBe("setup_settlement");
+      expect(state.turnPlayerIndex).toBe(0);
+      expect(state.completedTurns).toBe(0);
+      assertAllLegalActionsSucceed(state);
+
+      // Replay the exact setup placements from farm9373:
+      // Turn 0 (c1): corner "15" -> edge "21"
+      // Turn 1 (c5): corner "2"  -> edge "2"
+      // Turn 2 (c5): corner "49" -> edge "63" (grants 1 grain, 1 ore, 1 wool)
+      // Turn 3 (c1): corner "44" -> edge "53" (grants 1 lumber, 1 grain, 1 ore)
+      const c15 = topo.cornerIndexByColonistId.get("15")!;
+      const e21 = topo.edgeIndexByColonistId.get("21")!;
+      const c2 = topo.cornerIndexByColonistId.get("2")!;
+      const e2 = topo.edgeIndexByColonistId.get("2")!;
+      const c49 = topo.cornerIndexByColonistId.get("49")!;
+      const e63 = topo.edgeIndexByColonistId.get("63")!;
+      const c44 = topo.cornerIndexByColonistId.get("44")!;
+      const e53 = topo.edgeIndexByColonistId.get("53")!;
+
+      // Reject wrong player during setup
+      expectRejectedUnchanged(state, "c5", { type: "placeSetupSettlement", cornerIndex: c15 }, "not_active_player");
+      // Reject road before settlement
+      expectRejectedUnchanged(state, "c1", { type: "placeSetupRoad", edgeIndex: e21 }, "wrong_phase");
+
+      // Step 1: c1 places 1st settlement at c15
+      let step = applyAction(state, "c1", { type: "placeSetupSettlement", cornerIndex: c15 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.phase).toBe("setup_road");
+      expect(state.players[0].hand).toEqual({ lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 });
+      expect(state.players[0].visibleVp).toBe(1);
+      assertAllLegalActionsSucceed(state);
+
+      // Reject unconnected setup road
+      expectRejectedUnchanged(state, "c1", { type: "placeSetupRoad", edgeIndex: e2 }, "unconnected_road");
+
+      // Step 2: c1 places 1st road at e21 -> advances to c5 (turnPlayerIndex = 1, completedTurns = 1)
+      step = applyAction(state, "c1", { type: "placeSetupRoad", edgeIndex: e21 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.phase).toBe("setup_settlement");
+      expect(state.turnPlayerIndex).toBe(1);
+      expect(state.completedTurns).toBe(1);
+
+      // Distance rule: c5 cannot place on c15 or any neighbor of c15
+      expectRejectedUnchanged(state, "c5", { type: "placeSetupSettlement", cornerIndex: c15 }, "occupied_corner");
+      for (const adj of topo.corners[c15].adjacentCornerIndices) {
+        expectRejectedUnchanged(state, "c5", { type: "placeSetupSettlement", cornerIndex: adj }, "distance_rule_violation");
+      }
+
+      // Step 3: c5 places 1st settlement at c2 and road at e2 -> snake order keeps c5 active (completedTurns = 2, turnPlayerIndex = 1)
+      step = applyAction(state, "c5", { type: "placeSetupSettlement", cornerIndex: c2 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      step = applyAction(state, "c5", { type: "placeSetupRoad", edgeIndex: e2 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.completedTurns).toBe(2);
+      expect(state.turnPlayerIndex).toBe(1); // Snake turn-back: c5 places 2nd settlement immediately
+      expect(state.phase).toBe("setup_settlement");
+
+      // Step 4: c5 places 2nd settlement at c49 -> receives starting resources (1 wool, 1 grain, 1 ore, matching farm9373 Frame 101)
+      step = applyAction(state, "c5", { type: "placeSetupSettlement", cornerIndex: c49 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.phase).toBe("setup_road");
+      expect(state.players[1].hand).toEqual({ lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 });
+      expect(state.bank).toEqual({ lumber: 19, brick: 19, wool: 18, grain: 18, ore: 18 });
+
+      // Crucial setup rule: 2nd setup road MUST attach to the 2nd settlement (c49), NOT the 1st settlement (c2)!
+      const otherEdgeOnFirstSettlement = topo.corners[c2].incidentEdgeIndices.find((ei) => ei !== e2)!;
+      expectRejectedUnchanged(
+        state,
+        "c5",
+        { type: "placeSetupRoad", edgeIndex: otherEdgeOnFirstSettlement },
+        "unconnected_road"
+      );
+      expect(getLegalSetupRoadEdges(state, "c5")).not.toContain(otherEdgeOnFirstSettlement);
+
+      step = applyAction(state, "c5", { type: "placeSetupRoad", edgeIndex: e63 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.completedTurns).toBe(3);
+      expect(state.turnPlayerIndex).toBe(0); // Back to c1 for final setup pick
+      expect(state.phase).toBe("setup_settlement");
+
+      // Step 5: c1 places 2nd settlement at c44 and road at e53 -> transitions to normal play (completedTurns = 4, phase = "pre_roll", c1 active)
+      step = applyAction(state, "c1", { type: "placeSetupSettlement", cornerIndex: c44 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.players[0].hand).toEqual({ lumber: 1, brick: 0, wool: 0, grain: 1, ore: 1 });
+      expect(state.bank).toEqual({ lumber: 18, brick: 19, wool: 18, grain: 17, ore: 17 });
+
+      step = applyAction(state, "c1", { type: "placeSetupRoad", edgeIndex: e53 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.completedTurns).toBe(4);
+      expect(state.turnPlayerIndex).toBe(0);
+      expect(state.phase).toBe("pre_roll");
+      expect(state.dice.thrown).toBe(false);
+      expect(validateConcreteSimState(state).valid).toBe(true);
+
+      // Replay Turn 4 (c1 rolls 5+4=9, gets 1 brick, builds road on edge "30", ends turn -> matches farm9373 Frames 128-139)
+      step = applyAction(state, "c1", { type: "rollDice", d1: 5, d2: 4 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.phase).toBe("main");
+      expect(state.players[0].hand).toEqual({ lumber: 1, brick: 1, wool: 0, grain: 1, ore: 1 });
+      expect(state.bank.brick).toBe(18);
+      assertAllLegalActionsSucceed(state);
+
+      const e30 = topo.edgeIndexByColonistId.get("30")!;
+      step = applyAction(state, "c1", { type: "buildRoad", edgeIndex: e30 });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.players[0].roadLength).toBe(2);
+      expect(state.players[0].roadsLeft).toBe(12);
+      expect(state.bank.lumber).toBe(19);
+      expect(state.bank.brick).toBe(19);
+
+      step = applyAction(state, "c1", { type: "endTurn" });
+      expect(step.ok).toBe(true);
+      if (!step.ok) return;
+      state = step.state;
+      expect(state.completedTurns).toBe(5);
+      expect(state.turnPlayerIndex).toBe(1);
+      expect(state.phase).toBe("pre_roll");
+      expect(validateConcreteSimState(state).valid).toBe(true);
+    });
+
+    it("2. Enforces road, settlement, and city legality, opponent building road-continuation blocks, port ratios, and city settlement-supply return", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({ topology: topo, playerIds: ["c1", "c2"] });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      const state = initRes.state;
+
+      // Put state into "main" phase for c1 with known resources
+      state.phase = "main";
+      state.completedTurns = 4;
+      state.dice = { thrown: true, d1: 3, d2: 5, total: 8 };
+
+      // Find an interior corner c0 and a 2-step chain c0 -e1-> c1 -e2-> c2
+      const c0 = topo.corners.find((c) => c.adjacentCornerIndices.length === 3)!;
+      const e1 = c0.incidentEdgeIndices[0];
+      const c1Idx = topo.otherCornerOfEdge(e1, c0.index)!;
+      const e2 = topo.corners[c1Idx].incidentEdgeIndices.find((ei) => ei !== e1)!;
+      const c2Idx = topo.otherCornerOfEdge(e2, c1Idx)!;
+
+      // Place c1's settlement at c0.index and road on e1
+      state.cornerOwner[c0.index] = "c1";
+      state.cornerPiece[c0.index] = 1;
+      state.players[0].settlementsLeft = 4;
+      state.edgeOwner[e1] = "c1";
+      state.players[0].roadsLeft = 14;
+
+      // Give c1 resources for road, settlement, and city
+      state.players[0].hand = { lumber: 3, brick: 3, wool: 2, grain: 4, ore: 3 };
+      state.bank = { lumber: 16, brick: 16, wool: 17, grain: 15, ore: 16 };
+      updateLongestRoadAward(state);
+
+      // 1. Before opponent builds at c1Idx, e2 is legal for c1 to build a road
+      expect(getLegalRoadEdges(state, "c1")).toContain(e2);
+
+      // 2. Now suppose opponent c2 owns a settlement at c2Idx and builds a road + settlement at c1Idx?
+      // Wait: c1Idx is adjacent to c0.index, so a settlement at c1Idx would violate the distance rule with c0.index.
+      // Let's extend 1 more step: c0 -e1-> c1Idx -e2-> c2Idx -e3-> c3Idx, where c2Idx is 2 edges away from c0!
+      const e3 = topo.corners[c2Idx].incidentEdgeIndices.find((ei) => ei !== e2)!;
+      let res = applyAction(state, "c1", { type: "buildRoad", edgeIndex: e2 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      let cur = res.state;
+      expect(cur.edgeOwner[e2]).toBe("c1");
+      expect(getLegalRoadEdges(cur, "c1")).toContain(e3);
+
+      // Now place opponent c2's settlement at c2Idx (which is 2 edges from c0, so distance-rule legal!)
+      cur.cornerOwner[c2Idx] = "c2";
+      cur.cornerPiece[c2Idx] = 1;
+      cur.players[1].settlementsLeft = 4;
+      updateLongestRoadAward(cur);
+
+      // Because c2 owns a settlement at c2Idx, c1 is BLOCKED from continuing a new road onto e3 through c2Idx!
+      expect(getLegalRoadEdges(cur, "c1")).not.toContain(e3);
+      expectRejectedUnchanged(cur, "c1", { type: "buildRoad", edgeIndex: e3 }, "blocked_by_opponent_building");
+
+      // 3. Test settlement on a port corner updates player trade ratios (3:1 "any" and 2:1 specific port)
+      const anyPort = topo.ports.find((p) => p.kind === "any")!;
+      const specificPort = topo.ports.find((p) => p.kind !== "any")!;
+      const portCornerIdx = specificPort.cornerIndices[0];
+      const portIncidentEdge = topo.corners[portCornerIdx].incidentEdgeIndices[0];
+      cur.edgeOwner[portIncidentEdge] = "c1";
+      cur.players[0].roadsLeft -= 1;
+
+      res = applyAction(cur, "c1", { type: "buildSettlement", cornerIndex: portCornerIdx });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      cur = res.state;
+      expect(cur.players[0].ratios[specificPort.kind as Exclude<typeof specificPort.kind, "any">]).toBe(2);
+
+      // Also place a settlement on the 3:1 port and verify 3:1 updates 4 -> 3 without overwriting the 2:1 ratio
+      const anyPortCornerIdx = anyPort.cornerIndices.find(
+        (ci) => cur.cornerPiece[ci] === 0 && topo.corners[ci].adjacentCornerIndices.every((adj) => cur.cornerPiece[adj] === 0)
+      )!;
+      const anyPortEdge = topo.corners[anyPortCornerIdx].incidentEdgeIndices[0];
+      cur.edgeOwner[anyPortEdge] = "c1";
+      cur.players[0].roadsLeft -= 1;
+
+      res = applyAction(cur, "c1", { type: "buildSettlement", cornerIndex: anyPortCornerIdx });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      cur = res.state;
+      for (const r of ["lumber", "brick", "wool", "grain", "ore"] as const) {
+        if (r === specificPort.kind) expect(cur.players[0].ratios[r]).toBe(2);
+        else expect(cur.players[0].ratios[r]).toBe(3);
+      }
+
+      // 4. Test city upgrade returns 1 settlement to settlementsLeft (allowing a player at 0 settlementsLeft to build again after upgrading)
+      cur.players[0].settlementsLeft = 0;
+      expectRejectedUnchanged(cur, "c1", { type: "buildCity", cornerIndex: c2Idx }, "invalid_city_upgrade");
+      res = applyAction(cur, "c1", { type: "buildCity", cornerIndex: c0.index });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      cur = res.state;
+      expect(cur.cornerPiece[c0.index]).toBe(2);
+      expect(cur.players[0].citiesLeft).toBe(3);
+      expect(cur.players[0].settlementsLeft).toBe(1); // Returned to supply!
+      expect(validateConcreteSimState(cur).valid).toBe(true);
+      assertAllLegalActionsSucceed(cur);
+    });
+
+    it("3. Computes exact Longest Road on branched graphs and handles claim, tie retention, overtake, and opponent-settlement road breaks (including 3p tie -> unclaimed)", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({ topology: topo, playerIds: ["c1", "c2", "c3"] });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      const state = initRes.state;
+      state.phase = "main";
+      state.completedTurns = 6;
+      state.dice = { thrown: true, d1: 4, d2: 4, total: 8 };
+
+      // 1. Branched Y-network of 5 total road pieces where longest simple trail is only 4 must NOT claim Longest Road
+      // Find an interior corner with 3 incident edges: eA, eB, eC
+      const hub = topo.corners.find(
+        (c) =>
+          c.incidentEdgeIndices.length === 3 &&
+          c.adjacentCornerIndices.every((nbr) => topo.corners[nbr].incidentEdgeIndices.length === 3)
+      )!;
+      const [eA, eB, eC] = hub.incidentEdgeIndices;
+      const nA = topo.otherCornerOfEdge(eA, hub.index)!;
+      const nB = topo.otherCornerOfEdge(eB, hub.index)!;
+      const eA2 = topo.corners[nA].incidentEdgeIndices.find((ei) => ei !== eA)!;
+      const eB2 = topo.corners[nB].incidentEdgeIndices.find((ei) => ei !== eB)!;
+
+      // Y-shape: 2 edges on branch A (eA, eA2), 2 edges on branch B (eB, eB2), 1 edge on branch C (eC) = 5 road pieces, max trail = 4 (eA2-eA-eB-eB2)
+      for (const ei of [eA, eA2, eB, eB2, eC]) {
+        state.edgeOwner[ei] = "c1";
+      }
+      state.players[0].roadsLeft = 10;
+      updateLongestRoadAward(state);
+      expect(state.players[0].roadLength).toBe(4);
+      expect(state.players[0].hasLongestRoad).toBe(false);
+
+      // 2. Extend branch A by 1 more edge (eA3) so trail becomes eA3-eA2-eA-eB-eB2 = length 5 -> c1 claims Longest Road (+2 VP)
+      const nA2 = topo.otherCornerOfEdge(eA2, nA)!;
+      const eA3 = topo.corners[nA2].incidentEdgeIndices.find((ei) => ei !== eA2 && state.edgeOwner[ei] === null)!;
+      state.edgeOwner[eA3] = "c1";
+      state.players[0].roadsLeft = 9;
+      updateLongestRoadAward(state);
+      expect(state.players[0].roadLength).toBe(5);
+      expect(state.players[0].hasLongestRoad).toBe(true);
+      expect(state.players[0].visibleVp).toBe(2);
+
+      // 3. Build a 5-edge simple path for c2 on a disjoint hex -> tie at 5, incumbent c1 RETAINS Longest Road
+      const c2Hex = topo.hexes.find((h) => h.edgeIndices.every((ei) => state.edgeOwner[ei] === null))!;
+      const c2HexEdges = c2Hex.edgeIndices;
+      for (let k = 0; k < 5; k++) {
+        state.edgeOwner[c2HexEdges[k]] = "c2";
+      }
+      state.players[1].roadsLeft = 10;
+      updateLongestRoadAward(state);
+      expect(state.players[1].roadLength).toBe(5);
+      expect(state.players[0].hasLongestRoad).toBe(true);
+      expect(state.players[1].hasLongestRoad).toBe(false);
+
+      // 4. Give c2 the 6th edge of c2Hex -> c2 reaches length 6 and strictly overtakes c1!
+      state.edgeOwner[c2HexEdges[5]] = "c2";
+      state.players[1].roadsLeft = 9;
+      updateLongestRoadAward(state);
+      expect(state.players[1].roadLength).toBe(6);
+      expect(state.players[0].hasLongestRoad).toBe(false);
+      expect(state.players[0].visibleVp).toBe(0);
+      expect(state.players[1].hasLongestRoad).toBe(true);
+      expect(state.players[1].visibleVp).toBe(2);
+
+      // 5. Also give c3 a 5-edge path on another disjoint hex (so c1 has 5, c3 has 5, and c2 holds Longest Road with 6)
+      const disjointHex = topo.hexes.find(
+        (h) => h.edgeIndices.every((ei) => state.edgeOwner[ei] === null)
+      )!;
+      for (let k = 0; k < 5; k++) {
+        state.edgeOwner[disjointHex.edgeIndices[k]] = "c3";
+      }
+      state.players[2].roadsLeft = 10;
+      updateLongestRoadAward(state);
+      expect(state.players[2].roadLength).toBe(5);
+      expect(state.players[1].hasLongestRoad).toBe(true);
+
+      // 6. Now break c2's 6-edge cycle on c2Hex with TWO opponent settlements at opposite corners of c2Hex
+      // so c2's road length drops from 6 to 3!
+      // Then c1 (length 5) and c3 (length 5) are TIED for the new maximum >= 5.
+      // By Catan Almanac rules, c2 loses Longest Road and the award becomes UNCLAIMED (neither c1 nor c3 gets it)!
+      const c2BreakCorner1 = c2Hex.cornerIndices[0];
+      const c2BreakCorner2 = c2Hex.cornerIndices[3]; // opposite corner on c2Hex (3 steps away)
+      state.cornerOwner[c2BreakCorner1] = "c1";
+      state.cornerPiece[c2BreakCorner1] = 1;
+      state.cornerOwner[c2BreakCorner2] = "c1";
+      state.cornerPiece[c2BreakCorner2] = 1;
+      updateLongestRoadAward(state);
+
+      expect(state.players[1].roadLength).toBe(3);
+      expect(state.players[0].roadLength).toBe(5);
+      expect(state.players[2].roadLength).toBe(5);
+      expect(state.players[0].hasLongestRoad).toBe(false);
+      expect(state.players[1].hasLongestRoad).toBe(false);
+      expect(state.players[2].hasLongestRoad).toBe(false);
+
+      // 7. When c3's road is shortened below 5 (or c1 extends to 6), the sole leader >= 5 claims Longest Road
+      state.edgeOwner[disjointHex.edgeIndices[4]] = null;
+      updateLongestRoadAward(state);
+      expect(state.players[2].roadLength).toBe(4);
+      expect(state.players[0].roadLength).toBe(5);
+      expect(state.players[0].hasLongestRoad).toBe(true);
+    });
+
+    it("4. Enforces Largest Army transitions, ties, strict overtaking, and immediate Knight victory before robber move (spot195 rule)", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({ topology: topo, playerIds: ["c1", "c2"] });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+      state.phase = "pre_roll";
+      state.completedTurns = 4;
+      state.players[0].readyDevs = ["knight"];
+      state.players[0].knightsPlayed = 2;
+      state.players[0].playedDevs = ["knight", "knight"];
+      state.players[1].knightsPlayed = 3;
+      state.players[1].playedDevs = ["knight", "knight", "knight"];
+      state.players[1].hasLargestArmy = true;
+      state.devDeckOrder = state.devDeckOrder.slice(6);
+      updateLargestArmyAward(state);
+      expect(state.players[1].hasLargestArmy).toBe(true);
+      expect(state.players[1].visibleVp).toBe(2);
+
+      // c1 plays 3rd Knight in pre_roll -> ties c2 at 3 Knights -> c2 retains Largest Army, phase becomes "robber_move"
+      let res = applyAction(state, "c1", { type: "playKnight" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].knightsPlayed).toBe(3);
+      expect(state.players[0].hasLargestArmy).toBe(false);
+      expect(state.players[1].hasLargestArmy).toBe(true);
+      expect(state.phase).toBe("robber_move");
+
+      // Move robber in pre_roll -> returns to "pre_roll" because dice.thrown is still false!
+      const targetHex = topo.hexes.find((h) => h.index !== state.robberHexIndex)!.index;
+      res = applyAction(state, "c1", { type: "moveRobber", hexIndex: targetHex, victimId: null });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.phase).toBe("pre_roll");
+      expect(state.dice.thrown).toBe(false);
+
+      // Cannot play a second Knight on the same turn
+      state.players[0].readyDevs.push("knight");
+      state.devDeckOrder.pop();
+      expectRejectedUnchanged(state, "c1", { type: "playKnight" }, "dev_card_already_played_this_turn");
+
+      // Advance to c1's next turn where c1 has 13 VP and plays 4th Knight to overtake Largest Army (+2 VP = 15 VP -> immediate game_over!)
+      state.players[0].hasUsedDevThisTurn = false;
+      state.players[0].vpDevs = 13;
+      state.devDeckOrder.splice(0, 13);
+      updateLargestArmyAward(state);
+      expect(state.players[0].actualSimulatedVp).toBe(13);
+
+      res = applyAction(state, "c1", { type: "playKnight" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].knightsPlayed).toBe(4);
+      expect(state.players[0].hasLargestArmy).toBe(true);
+      expect(state.players[1].hasLargestArmy).toBe(false);
+      expect(state.players[0].actualSimulatedVp).toBe(15);
+      expect(state.phase).toBe("game_over");
+      expect(state.winnerId).toBe("c1");
+    });
+
+    it("5. Enforces dev-card timing, Road Building (2 roads, 1 road supply, mid-card win), Year of Plenty bank limits, Monopoly conservation, and VP dev immediate win", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({
+        topology: topo,
+        playerIds: ["c1", "c2"],
+        devDeckOrder: [
+          "monopoly",
+          "yearOfPlenty",
+          "roadBuilding",
+          "victoryPoint",
+          ...new Array(21).fill("knight")
+        ]
+      });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+      state.phase = "main";
+      state.completedTurns = 4;
+      state.dice = { thrown: true, d1: 3, d2: 5, total: 8 };
+
+      // Place initial road for c1 so Road Building has legal extensions
+      state.edgeOwner[0] = "c1";
+      state.players[0].roadsLeft = 14;
+      state.players[0].hand = { lumber: 0, brick: 0, wool: 3, grain: 3, ore: 3 };
+      state.bank = { lumber: 19, brick: 19, wool: 16, grain: 16, ore: 16 };
+
+      // 1. Buy Monopoly on current turn -> goes to boughtDevsThisTurn, CANNOT be played this turn
+      let res = applyAction(state, "c1", { type: "buyDevCard" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].boughtDevsThisTurn).toEqual(["monopoly"]);
+      expect(state.players[0].readyDevs).toEqual([]);
+      expectRejectedUnchanged(state, "c1", { type: "playMonopoly", resource: "lumber" }, "dev_card_bought_this_turn");
+
+      // Also buy Year of Plenty and Road Building this turn
+      res = applyAction(state, "c1", { type: "buyDevCard" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      res = applyAction(state, "c1", { type: "buyDevCard" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].boughtDevsThisTurn).toEqual(["monopoly", "yearOfPlenty", "roadBuilding"]);
+      expectRejectedUnchanged(
+        state,
+        "c1",
+        { type: "playYearOfPlenty", resources: ["lumber", "brick"] },
+        "dev_card_bought_this_turn"
+      );
+      expectRejectedUnchanged(state, "c1", { type: "playRoadBuilding" }, "dev_card_bought_this_turn");
+
+      // End turn for c1 -> boughtDevsThisTurn moves to readyDevs!
+      res = applyAction(state, "c1", { type: "endTurn" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].readyDevs).toEqual(["monopoly", "yearOfPlenty", "roadBuilding"]);
+      expect(state.players[0].boughtDevsThisTurn).toEqual([]);
+
+      // Complete c2's turn to return to c1
+      res = applyAction(state, "c2", { type: "rollDice", d1: 2, d2: 4 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      res = applyAction(state, "c2", { type: "endTurn" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+
+      // 2. Test Year of Plenty bank supply limits:
+      // Set bank.ore = 1 (with 18 ore in c2's hand) -> requesting ["ore", "ore"] must fail closed, while ["ore", "grain"] succeeds!
+      state.players[1].hand.ore = 18;
+      state.bank.ore = 1;
+      expectRejectedUnchanged(
+        state,
+        "c1",
+        { type: "playYearOfPlenty", resources: ["ore", "ore"] },
+        "insufficient_bank_resources"
+      );
+      res = applyAction(state, "c1", { type: "playYearOfPlenty", resources: ["ore", "grain"] });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].hand.ore).toBe(1);
+      expect(state.players[0].hand.grain).toBe(1);
+      expect(state.bank.ore).toBe(0);
+      expect(state.players[0].hasUsedDevThisTurn).toBe(true);
+      expect(validateConcreteSimState(state).valid).toBe(true);
+
+      // Cannot play Monopoly on the same turn after playing Year of Plenty
+      expectRejectedUnchanged(state, "c1", { type: "playMonopoly", resource: "ore" }, "dev_card_already_played_this_turn");
+
+      // 3. Test Monopoly on next turn: steals all 18 ore from c2 without changing bank or violating conservation
+      state.players[0].hasUsedDevThisTurn = false;
+      res = applyAction(state, "c1", { type: "playMonopoly", resource: "ore" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].hand.ore).toBe(19);
+      expect(state.players[1].hand.ore).toBe(0);
+      expect(state.bank.ore).toBe(0);
+      expect(validateConcreteSimState(state).valid).toBe(true);
+
+      // 4. Test Road Building: places 2 free roads step-by-step ("road_building_1" -> "road_building_2" -> "pre_roll")
+      state.players[0].hasUsedDevThisTurn = false;
+      res = applyAction(state, "c1", { type: "playRoadBuilding" });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.phase).toBe("road_building_1");
+      assertAllLegalActionsSucceed(state);
+
+      const firstFreeEdge = getLegalRoadEdges(state, "c1")[0];
+      res = applyAction(state, "c1", { type: "placeFreeRoad", edgeIndex: firstFreeEdge });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.phase).toBe("road_building_2");
+      assertAllLegalActionsSucceed(state);
+
+      const secondFreeEdge = getLegalRoadEdges(state, "c1")[0];
+      res = applyAction(state, "c1", { type: "placeFreeRoad", edgeIndex: secondFreeEdge });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.phase).toBe("pre_roll");
+      expect(state.players[0].roadsLeft).toBe(12);
+
+      // 5. Test buying a Victory Point dev card at 14 VP immediately ends the game (sheep8929 rule)
+      res = applyAction(state, "c1", { type: "rollDice", d1: 3, d2: 3 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      state.players[0].vpDevs = 14;
+      state.devDeckOrder.splice(1, 14); // keep "victoryPoint" at index 0 while conserving 25 cards
+      state.players[0].hand.wool = 1;
+      state.players[0].hand.grain = 1;
+      state.bank.wool -= 1;
+      state.bank.grain -= 1;
+      recomputeVpAndCheck: {
+        updateLongestRoadAward(state);
+        expect(state.players[0].actualSimulatedVp).toBe(14);
+        res = applyAction(state, "c1", { type: "buyDevCard" });
+        expect(res.ok).toBe(true);
+        if (!res.ok) break recomputeVpAndCheck;
+        state = res.state;
+        expect(state.players[0].vpDevs).toBe(15);
+        expect(state.players[0].actualSimulatedVp).toBe(15);
+        expect(state.players[0].visibleVp).toBe(0); // VP dev card remains distinct from visibleVp!
+        expect(state.phase).toBe("game_over");
+        expect(state.winnerId).toBe("c1");
+      }
+    });
+
+    it("6. Enforces robber blocking on single hex only, Friendly Robber public-VP rule (ship2170 rule), discards, and bank-shortage production rules", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({ topology: topo, playerIds: ["c1", "c2"] });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+      state.phase = "pre_roll";
+      state.completedTurns = 4;
+
+      // Find two hexes that share the SAME dice number (e.g. number 8)
+      const hexesWith8 = topo.hexIndicesByDiceNumber.get(8)!;
+      expect(hexesWith8.length).toBe(2);
+      const [h8a, h8b] = hexesWith8;
+      const resA = topo.hexes[h8a].resource!;
+      const resB = topo.hexes[h8b].resource!;
+
+      // Place a c1 settlement on h8a (and not touching h8b) and a c2 settlement on h8b (and not touching h8a)
+      const cOnA = topo.hexes[h8a].cornerIndices.find((ci) => !topo.hexes[h8b].cornerIndices.includes(ci))!;
+      const cOnB = topo.hexes[h8b].cornerIndices.find(
+        (ci) => !topo.hexes[h8a].cornerIndices.includes(ci) && !topo.corners[cOnA].adjacentCornerIndices.includes(ci)
+      )!;
+      state.cornerOwner[cOnA] = "c1";
+      state.cornerPiece[cOnA] = 1;
+      state.players[0].settlementsLeft = 4;
+      state.cornerOwner[cOnB] = "c2";
+      state.cornerPiece[cOnB] = 1;
+      state.players[1].settlementsLeft = 4;
+      updateLongestRoadAward(state);
+
+      // Put robber on h8a: rolling 8 must block h8a (c1 gets 0 from h8a) while h8b STILL produces for c2!
+      state.robberHexIndex = h8a;
+      let res = applyAction(state, "c1", { type: "rollDice", d1: 4, d2: 4 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].hand[resA]).toBe(0);
+      expect(state.players[1].hand[resB]).toBe(1);
+
+      // Test bank shortage rules on dice production:
+      // Case A: Single claimant owed 2 (from a city on h8b), bank only has 1 of resB -> single claimant receives the 1 remaining card!
+      state.phase = "pre_roll";
+      state.dice = { thrown: false };
+      state.cornerPiece[cOnB] = 2; // upgrade c2 on h8b to city (owed 2 of resB)
+      state.players[0].hand[resB] = 17;
+      state.players[1].hand[resB] = 1;
+      state.bank[resB] = 1; // Only 1 left in bank!
+      res = applyAction(state, "c1", { type: "rollDice", d1: 4, d2: 4 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[1].hand[resB]).toBe(2); // Received the 1 available card
+      expect(state.bank[resB]).toBe(0);
+
+      // Case B: Multiple claimants owed resB when totalOwed > bank[resB] -> NO claimant receives resB!
+      const secondCornerOnB = topo.hexes[h8b].cornerIndices.find(
+        (ci) =>
+          ci !== cOnB &&
+          !topo.corners[cOnB].adjacentCornerIndices.includes(ci) &&
+          !topo.corners[cOnA].adjacentCornerIndices.includes(ci)
+      )!;
+      state.cornerOwner[secondCornerOnB] = "c1";
+      state.cornerPiece[secondCornerOnB] = 1; // Now c1 is owed 1 and c2 is owed 2 on h8b (totalOwed = 3)
+      state.players[0].hand[resB] = 16;
+      state.players[1].hand[resB] = 1;
+      state.bank[resB] = 2; // 2 left in bank < 3 totalOwed across 2 players!
+      state.phase = "pre_roll";
+      state.dice = { thrown: false };
+      res = applyAction(state, "c1", { type: "rollDice", d1: 4, d2: 4 });
+      expect(res.ok).toBe(true);
+      if (!res.ok) return;
+      state = res.state;
+      expect(state.players[0].hand[resB]).toBe(16); // Unchanged!
+      expect(state.players[1].hand[resB]).toBe(1); // Unchanged!
+      expect(state.bank[resB]).toBe(2); // Unchanged!
+
+      // Test Friendly Robber rule using observable visibleVp (ship2170 rule):
+      // Give c2 only 2 visible VP (the city at cOnB) + 1 hidden VP dev card (actualSimulatedVp = 3, visibleVp = 2).
+      // Because Friendly Robber checks visibleVp (< 3), c1 CANNOT move the robber to a hex owned only by c2!
+      state.cornerOwner[secondCornerOnB] = null;
+      state.cornerPiece[secondCornerOnB] = 0;
+      state.players[1].vpDevs = 1;
+      state.devDeckOrder.pop();
+      updateLongestRoadAward(state);
+      expect(state.players[1].visibleVp).toBe(2);
+      expect(state.players[1].actualSimulatedVp).toBe(3);
+
+      state.phase = "robber_move";
+      expectRejectedUnchanged(
+        state,
+        "c1",
+        { type: "moveRobber", hexIndex: h8b, victimId: "c2" },
+        "friendly_robber_restriction",
+        { stolenResource: resB }
+      );
+      expect(getLegalRobberMoves(state, "c1").map((m) => m.hexIndex)).not.toContain(h8b);
+
+      // Once c2 gains a 3rd visible VP (e.g. a settlement), h8b becomes legal to rob!
+      const extraCornerForC2 = topo.corners.find(
+        (c) =>
+          state.cornerPiece[c.index] === 0 &&
+          c.adjacentCornerIndices.every((adj) => state.cornerPiece[adj] === 0)
+      )!.index;
+      state.cornerOwner[extraCornerForC2] = "c2";
+      state.cornerPiece[extraCornerForC2] = 1;
+      updateLongestRoadAward(state);
+      expect(state.players[1].visibleVp).toBe(3);
+      expect(getLegalRobberMoves(state, "c1").map((m) => m.hexIndex)).toContain(h8b);
+    });
+
+    it("7. Executes deterministic 4-player scenario covering 4p snake setup, multi-player discards, multi-victim robber choice, 4p Monopoly, and non-self playerTrade", () => {
+      const topo = getStandardTopology();
+      // Use the 4-player seat order from recording path4053: ["c3", "c2", "c1", "c5"]
+      const initRes = createInitialConcreteState({
+        topology: topo,
+        playerIds: ["c3", "c2", "c1", "c5"]
+      });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+      expect(state.rules.victoryPointsToWin).toBe(10);
+      expect(state.rules.cardDiscardLimit).toBe(7);
+
+      // Execute full 8-turn 4-player snake draft: [c3, c2, c1, c5, c5, c1, c2, c3]
+      const expectedOrder = ["c3", "c2", "c1", "c5", "c5", "c1", "c2", "c3"];
+      for (let stepIdx = 0; stepIdx < 8; stepIdx++) {
+        const expectedPid = expectedOrder[stepIdx];
+        expect(state.players[state.turnPlayerIndex].id).toBe(expectedPid);
+        expect(state.phase).toBe("setup_settlement");
+
+        const legalCorners = getLegalSetupSettlementCorners(state, expectedPid);
+        expect(legalCorners.length).toBeGreaterThan(0);
+        const cornerIndex = legalCorners[0];
+        let r1 = applyAction(state, expectedPid, { type: "placeSetupSettlement", cornerIndex });
+        expect(r1.ok).toBe(true);
+        if (!r1.ok) return;
+        state = r1.state;
+        expect(state.phase).toBe("setup_road");
+
+        const legalEdges = getLegalSetupRoadEdges(state, expectedPid);
+        expect(legalEdges.length).toBeGreaterThan(0);
+        let r2 = applyAction(state, expectedPid, { type: "placeSetupRoad", edgeIndex: legalEdges[0] });
+        expect(r2.ok).toBe(true);
+        if (!r2.ok) return;
+        state = r2.state;
+      }
+
+      // After 8 setup turns, normal play begins at completedTurns = 8 with c3 (index 0) in "pre_roll"
+      expect(state.completedTurns).toBe(8);
+      expect(state.turnPlayerIndex).toBe(0);
+      expect(state.players[state.turnPlayerIndex].id).toBe("c3");
+      expect(state.phase).toBe("pre_roll");
+      expect(validateConcreteSimState(state).valid).toBe(true);
+
+      // Give c2 (8 cards) and c5 (9 cards) > 7 discard limit, then roll a 7 with c3
+      state.players = state.players.map((p) => ({ ...p, hand: { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 } }));
+      state.players[1].hand = { lumber: 4, brick: 4, wool: 0, grain: 0, ore: 0 }; // c2 has 8 -> must discard 4
+      state.players[3].hand = { lumber: 0, brick: 0, wool: 5, grain: 4, ore: 0 }; // c5 has 9 -> must discard 4
+      state.bank = { lumber: 15, brick: 15, wool: 14, grain: 15, ore: 19 };
+
+      let roll7 = applyAction(state, "c3", { type: "rollDice", d1: 3, d2: 4 });
+      expect(roll7.ok).toBe(true);
+      if (!roll7.ok) return;
+      state = roll7.state;
+      expect(state.phase).toBe("discard");
+      expect(state.players[0].pendingDiscardCount).toBe(0);
+      expect(state.players[1].pendingDiscardCount).toBe(4);
+      expect(state.players[2].pendingDiscardCount).toBe(0);
+      expect(state.players[3].pendingDiscardCount).toBe(4);
+      assertAllLegalActionsSucceed(state);
+
+      // c3 cannot discard because pendingDiscardCount is 0
+      expectRejectedUnchanged(state, "c3", { type: "discard", cards: { lumber: 1 } }, "no_discard_required");
+      // c2 discards 4 cards -> phase stays "discard" because c5 still must discard 4
+      let d1 = applyAction(state, "c2", { type: "discard", cards: { lumber: 2, brick: 2 } });
+      expect(d1.ok).toBe(true);
+      if (!d1.ok) return;
+      state = d1.state;
+      expect(state.phase).toBe("discard");
+      expect(state.players[1].pendingDiscardCount).toBe(0);
+
+      // c5 discards 4 cards -> all discards complete -> phase transitions to "robber_move" for c3!
+      let d2 = applyAction(state, "c5", { type: "discard", cards: { wool: 2, grain: 2 } });
+      expect(d2.ok).toBe(true);
+      if (!d2.ok) return;
+      state = d2.state;
+      expect(state.phase).toBe("robber_move");
+      expect(state.players[state.turnPlayerIndex].id).toBe("c3");
+
+      // Place c2 and c5 settlements on opposite corners of a hex so BOTH c2 and c5 are eligible victims on that hex
+      const sharedHex = topo.hexes.find(
+        (h) =>
+          h.index !== state.robberHexIndex &&
+          h.cornerIndices.every((ci) => state.cornerPiece[ci] === 0 && topo.corners[ci].adjacentCornerIndices.every((a) => state.cornerPiece[a] === 0))
+      );
+      if (sharedHex) {
+        const sc1 = sharedHex.cornerIndices[0];
+        const sc2 = sharedHex.cornerIndices[3];
+        state.cornerOwner[sc1] = "c2";
+        state.cornerPiece[sc1] = 1;
+        state.cornerOwner[sc2] = "c5";
+        state.cornerPiece[sc2] = 1;
+        expect(getEligibleRobberVictims(state, "c3", sharedHex.index)).toEqual(["c2", "c5"]);
+        // Omitting victimId when 2 victims are eligible must fail closed
+        expectRejectedUnchanged(state, "c3", { type: "moveRobber", hexIndex: sharedHex.index }, "invalid_robber_victim");
+      }
+
+      // Move robber and enter "main" phase for c3, then end c3's turn so c2 becomes active
+      const legalRobberAction = getLegalActions(state, "c3")[0] as Extract<SimulatedAction, { type: "moveRobber" }>;
+      const robOutcome: ActionOutcome | undefined =
+        typeof legalRobberAction.victimId === "string"
+          ? {
+              stolenResource: (["lumber", "brick", "wool", "grain", "ore"] as const).find(
+                (r) => state.players.find((p) => p.id === legalRobberAction.victimId)!.hand[r] > 0
+              )!
+            }
+          : undefined;
+      let rm = applyAction(state, "c3", legalRobberAction, robOutcome);
+      expect(rm.ok).toBe(true);
+      if (!rm.ok) return;
+      state = rm.state;
+      expect(state.phase).toBe("main");
+
+      // Advance to c2's main phase and execute a domestic trade between c2 and c5 (neither is c1!)
+      let et = applyAction(state, "c3", { type: "endTurn" });
+      expect(et.ok).toBe(true);
+      if (!et.ok) return;
+      state = et.state;
+      expect(state.players[state.turnPlayerIndex].id).toBe("c2");
+
+      let rollC2 = applyAction(state, "c2", { type: "rollDice", d1: 2, d2: 3 });
+      expect(rollC2.ok).toBe(true);
+      if (!rollC2.ok) return;
+      state = rollC2.state;
+      expect(state.phase).toBe("main");
+      assertAllLegalActionsSucceed(state, "c2", true);
+
+      // Reject same-resource swap (e.g. 1 lumber for 1 lumber)
+      expectRejectedUnchanged(
+        state,
+        "c2",
+        { type: "playerTrade", partnerId: "c5", give: { lumber: 1 }, receive: { lumber: 1 } },
+        "invalid_trade"
+      );
+
+      // Valid domestic trade between c2 (gives 1 brick) and c5 (gives 1 wool)
+      const c2BrickBefore = state.players[1].hand.brick;
+      const c5WoolBefore = state.players[3].hand.wool;
+      let tradeRes = applyAction(state, "c2", {
+        type: "playerTrade",
+        partnerId: "c5",
+        give: { brick: 1 },
+        receive: { wool: 1 }
+      });
+      expect(tradeRes.ok).toBe(true);
+      if (!tradeRes.ok) return;
+      state = tradeRes.state;
+      expect(state.players[1].hand.brick).toBe(c2BrickBefore - 1);
+      expect(state.players[1].hand.wool).toBeGreaterThanOrEqual(1);
+      expect(state.players[3].hand.brick).toBeGreaterThanOrEqual(1);
+      expect(state.players[3].hand.wool).toBe(c5WoolBefore - 1);
+      expect(validateConcreteSimState(state).valid).toBe(true);
+    });
+
+    it("8. Enforces strict 3-way information boundary on materializeConcreteState and fails closed on unsupported variants/rulesets", () => {
+      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
+      const farmPlacements = placementsFrom(farmParsed.events);
+      const farmParser = new LogParser(farmRec.meta.me);
+      const farmTracker = new HandTracker();
+      for (const row of farmRec.log) {
+        if (!row.text) continue;
+        const r = farmParser.push(row);
+        if (r.kind === "event") farmTracker.apply(r.event);
+      }
+      const oppView = farmTracker.views().find((v) => v.name !== farmRec.meta.me);
+
+      const observed = buildObservedGameState({
+        board: farmParsed.board!,
+        placements: farmPlacements,
+        snapshot: farmParsed.snapshot,
+        events: farmParsed.events,
+        selfId: farmParsed.selfId,
+        oppHandView: oppView,
+        warnings: farmParsed.warnings
+      });
+
+      const observedBefore = JSON.stringify({
+        ...observed,
+        topology: undefined,
+        cornerPiece: Array.from(observed.cornerPiece)
+      });
+
+      // 1. Calling materializeConcreteState without explicit determinization MUST fail closed because opponent c1's hand
+      // is an INFERENCE (inferenceSource === "hand_tracker", exact === null) and c1 has 2 unknown face-down dev cards!
+      const withoutDet = materializeConcreteState(observed);
+      expect(withoutDet.ok).toBe(false);
+      if (!withoutDet.ok) {
+        expect(withoutDet.error.code).toBe("missing_outcome");
+      }
+
+      // 2. Supplying explicit determinization materializes a valid ConcreteSimulatedGameState without mutating `observed`
+      // and keeps `observedConfirmedVp` (14) strictly separate from `actualSimulatedVp` (14 + 2 = 16)!
+      const remainingPool = { ...observed.devDeck.unseenPool };
+      remainingPool.victoryPoint -= 2; // assign 2 VP cards to c1's unknown devs
+      const explicitDeck: Array<"knight" | "victoryPoint" | "roadBuilding" | "yearOfPlenty" | "monopoly"> = [];
+      for (const [k, count] of Object.entries(remainingPool)) {
+        for (let i = 0; i < count; i++) {
+          explicitDeck.push(k as "knight" | "victoryPoint" | "roadBuilding" | "yearOfPlenty" | "monopoly");
+        }
+      }
+
+      const withDet = materializeConcreteState(observed, {
+        handsByPlayerId: {
+          c1: { ...observed.playerById["c1"].hand.likely }
+        },
+        unknownDevsByPlayerId: {
+          c1: { vp: 2 }
+        },
+        devDeckOrder: explicitDeck
+      });
+      expect(withDet.ok).toBe(true);
+      if (withDet.ok) {
+        const simC1 = withDet.state.players.find((p) => p.id === "c1")!;
+        expect(simC1.visibleVp).toBe(14);
+        expect(simC1.observedConfirmedVp).toBe(14);
+        expect(simC1.actualSimulatedVp).toBe(16);
+      }
+      expect(
+        JSON.stringify({
+          ...observed,
+          topology: undefined,
+          cornerPiece: Array.from(observed.cornerPiece)
+        })
+      ).toBe(observedBefore);
+
+      // 3. Fail-closed checks for unsupported board variants, 5–6 players, Special Building Phase, and expansions
+      const topo = observed.topology;
+      expect(
+        createInitialConcreteState({
+          topology: topo,
+          playerIds: ["c1", "c2", "c3", "c4", "c5"]
+        }).ok
+      ).toBe(false);
+      expect(
+        createInitialConcreteState({
+          topology: topo,
+          playerIds: ["c1", "c2"],
+          rules: { specialBuildingPhase: true }
+        }).ok
+      ).toBe(false);
+      expect(
+        createInitialConcreteState({
+          topology: topo,
+          playerIds: ["c1", "c2"],
+          rules: { extensionSetting: 1 }
+        }).ok
+      ).toBe(false);
+
+      const nonStandardTopo = buildBoardTopology({
+        ...farmParsed.board!,
+        hexes: farmParsed.board!.hexes.slice(0, 18)
+      });
+      expect(nonStandardTopo.variant.isStandard19Hex).toBe(false);
+      const nonStdRes = createInitialConcreteState({
+        topology: nonStandardTopo,
+        playerIds: ["c1", "c2"]
+      });
+      expect(nonStdRes.ok).toBe(false);
+      if (!nonStdRes.ok) {
+        expect(nonStdRes.error.code).toBe("unsupported_variant");
+      }
+    });
+
+    it("9. Measures getLegalActions and applyAction latency across representative game phases", () => {
+      const topo = getStandardTopology();
+      const initRes = createInitialConcreteState({ topology: topo, playerIds: ["c1", "c2"] });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      let state = initRes.state;
+
+      // Run setup + 20 turns of legal actions and measure latency
+      let getLegalCalls = 0;
+      let getLegalMs = 0;
+      let applyCalls = 0;
+      let applyMs = 0;
+
+      for (let step = 0; step < 60 && state.phase !== "game_over"; step++) {
+        const actorId =
+          state.phase === "discard"
+            ? state.players.find((p) => p.pendingDiscardCount > 0)!.id
+            : state.players[state.turnPlayerIndex].id;
+
+        const t0 = performance.now();
+        const actions = getLegalActions(state, actorId);
+        const t1 = performance.now();
+        getLegalMs += t1 - t0;
+        getLegalCalls++;
+
+        expect(actions.length).toBeGreaterThan(0);
+        const chosen = actions[step % actions.length];
+        let outcome: ActionOutcome | undefined;
+        if (chosen.type === "rollDice") {
+          const totals = [6, 8, 5, 9, 7, 4, 10];
+          const tot = totals[step % totals.length];
+          outcome = { dice: { total: tot } };
+        } else if (chosen.type === "moveRobber" && typeof chosen.victimId === "string") {
+          const v = state.players.find((p) => p.id === chosen.victimId)!;
+          const r = (["lumber", "brick", "wool", "grain", "ore"] as const).find((k) => v.hand[k] > 0)!;
+          outcome = { stolenResource: r };
+        }
+
+        const t2 = performance.now();
+        const res = applyAction(state, actorId, chosen, outcome);
+        const t3 = performance.now();
+        applyMs += t3 - t2;
+        applyCalls++;
+
+        expect(res.ok).toBe(true);
+        if (!res.ok) break;
+        state = res.state;
+        expect(validateConcreteSimState(state).valid).toBe(true);
+      }
+
+      const avgGetLegalUs = (getLegalMs * 1000) / getLegalCalls;
+      const avgApplyUs = (applyMs * 1000) / applyCalls;
+      console.log(
+        `[Stage 3.2 Benchmarks across ${applyCalls} transitions] getLegalActions: ${avgGetLegalUs.toFixed(1)} µs/call | applyAction (incl. deep clone & Longest Road): ${avgApplyUs.toFixed(1)} µs/call`
+      );
+    });
+  });
 });
+
