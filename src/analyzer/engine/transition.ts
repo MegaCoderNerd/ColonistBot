@@ -189,6 +189,8 @@ export interface ConcreteDeterminizationInput {
   readonly turnPlayerId?: string;
   /** Explicit robber hex index if `observed.robberHexIndex === null`. */
   readonly robberHexIndex?: number;
+  /** Explicit diceMode override if `observed.rules.diceMode.mode === "unknown"`. */
+  readonly diceMode?: "balanced" | "random";
 }
 
 export interface CreateInitialConcreteStateOptions {
@@ -776,7 +778,9 @@ export function getLegalActions(
     }
 
     case "year_of_plenty": {
-      if (!active.hasUsedDevThisTurn && !active.readyDevs.includes("yearOfPlenty")) return [];
+      const alreadyConsumed =
+        active.hasUsedDevThisTurn && active.playedDevs[active.playedDevs.length - 1] === "yearOfPlenty";
+      if (!alreadyConsumed && (active.hasUsedDevThisTurn || !active.readyDevs.includes("yearOfPlenty"))) return [];
       return enumerateYearOfPlentyPicks(state.bank).map((resources) => ({
         type: "playYearOfPlenty",
         resources
@@ -784,7 +788,9 @@ export function getLegalActions(
     }
 
     case "monopoly": {
-      if (!active.hasUsedDevThisTurn && !active.readyDevs.includes("monopoly")) return [];
+      const alreadyConsumed =
+        active.hasUsedDevThisTurn && active.playedDevs[active.playedDevs.length - 1] === "monopoly";
+      if (!alreadyConsumed && (active.hasUsedDevThisTurn || !active.readyDevs.includes("monopoly"))) return [];
       return RESOURCES.map((resource) => ({
         type: "playMonopoly",
         resource
@@ -1881,12 +1887,22 @@ export function materializeConcreteState(
   observed: ObservedGameState,
   determinization?: ConcreteDeterminizationInput
 ): TransitionResult {
+  const resolvedDiceMode =
+    determinization?.diceMode ??
+    (observed.rules.diceMode.mode !== "unknown" ? observed.rules.diceMode.mode : undefined);
+  if (!resolvedDiceMode) {
+    return fail(
+      "unsupported_ruleset",
+      `Cannot materialize ConcreteSimulatedGameState with unresolved diceMode='${observed.rules.diceMode.mode}' (setting=${String(observed.rules.diceMode.setting)}). Supply an explicit diceMode override.`
+    );
+  }
+
   const rules: ConcreteSimulatedGameState["rules"] = {
     victoryPointsToWin: observed.rules.victoryPointsToWin.value,
     cardDiscardLimit: observed.rules.cardDiscardLimit.value,
     friendlyRobber: observed.rules.friendlyRobber.value,
     friendlyRobberMinVisibleVp: observed.rules.friendlyRobber.minVisibleVp,
-    diceMode: observed.rules.diceMode.mode === "random" ? "random" : "balanced",
+    diceMode: resolvedDiceMode,
     maxPlayers: observed.rules.maxPlayers.value,
     bankResourceCap: BANK_RESOURCE_CAP,
     maxSettlementsPerPlayer: MAX_SETTLEMENTS,
@@ -2012,6 +2028,11 @@ export function materializeConcreteState(
     bank[r] = BANK_RESOURCE_CAP - held;
   }
 
+  const winnerId =
+    phase === "game_over"
+      ? (concretePlayers.find((p) => p.actualSimulatedVp >= rules.victoryPointsToWin)?.id ?? turnPlayerId)
+      : undefined;
+
   const simState: ConcreteSimulatedGameState = {
     kind: "simulated",
     topology: observed.topology,
@@ -2032,7 +2053,8 @@ export function materializeConcreteState(
       ...(observed.dice.d2 !== undefined ? { d2: observed.dice.d2 } : {}),
       ...(observed.dice.total !== undefined ? { total: observed.dice.total } : {})
     },
-    rules
+    rules,
+    ...(winnerId !== undefined ? { winnerId } : {})
   };
 
   const val = validateConcreteSimState(simState);

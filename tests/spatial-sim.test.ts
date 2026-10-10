@@ -40,6 +40,29 @@ import {
   type ActionOutcome,
   type SimulatedAction
 } from "../src/analyzer/engine/transition";
+import { createSeededRng, deriveTrialSeed, hashSeed } from "../src/analyzer/engine/rng";
+import {
+  Balanced24Of36ShoeDiceModel,
+  BalancedStationaryMarginalDiceModel,
+  COLONIST_1V1_EMPIRICAL_DICE_SUMMARY,
+  computeRollSequenceStats,
+  createDiceModel,
+  DICE_SUMS,
+  evaluateDiceModelsOnHoldoutGames,
+  FAIR_2D6_COMBINATION_COUNTS,
+  FAIR_2D6_PROBABILITIES,
+  resolveDiceModelForRules,
+  StandardFairDiceModel,
+  UnsupportedDiceModel
+} from "../src/analyzer/engine/diceModel";
+import { sampleDeterminization } from "../src/analyzer/engine/determinize";
+import {
+  baselineRolloutPolicy,
+  findImmediateWinningAction,
+  runDeterminizedRollouts,
+  runRollout,
+  type RolloutPolicy
+} from "../src/analyzer/engine/rollout";
 import type { Recording } from "../src/shared/schema";
 
 const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08.json";
@@ -1677,5 +1700,752 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       );
     });
   });
+
+  // ===========================================================================
+  // STAGE 3.3 — Dice Modeling, Hidden-Information Determinization & Rollout Engine
+  // ===========================================================================
+  describe("Stage 3.3 — Dice Modeling, Hidden-Information Determinization, and Rollout Engine", () => {
+    function buildMidgameObservedFixture(recId: string, frameLimit: number) {
+      const rec = recordings.find((r) => r.id === recId)!;
+      const { decoded } = decodeFrames(rec.frames.slice(0, frameLimit));
+      const parsed = stateDiffAdapter.parse(decoded);
+      const placements = placementsFrom(parsed.events);
+      return buildObservedGameState({
+        board: parsed.board!,
+        placements,
+        snapshot: parsed.snapshot,
+        events: parsed.events,
+        selfId: parsed.selfId,
+        warnings: parsed.warnings
+      });
+    }
+
+    it("1. Reproducible SeededRng & Standard Fair Two-Dice Model (exact probabilities and sampling)", () => {
+      // SeededRng reproducibility, bounds, weightedIndex, shuffle, clone, and fork
+      const rngA = createSeededRng(424242);
+      const rngB = createSeededRng(424242);
+      const clonedA = rngA.clone();
+
+      for (let i = 0; i < 200; i++) {
+        const fA = rngA.nextFloat();
+        const fB = rngB.nextFloat();
+        const fClone = clonedA.nextFloat();
+        expect(fA).toBe(fB);
+        expect(fA).toBe(fClone);
+        expect(Number.isNaN(fA)).toBe(false);
+        expect(fA).toBeGreaterThanOrEqual(0);
+        expect(fA).toBeLessThan(1);
+
+        const intA = rngA.nextIntRange(2, 12);
+        const intB = rngB.nextIntRange(2, 12);
+        const intClone = clonedA.nextIntRange(2, 12);
+        expect(intA).toBe(intB);
+        expect(intA).toBe(intClone);
+        expect(intA).toBeGreaterThanOrEqual(2);
+        expect(intA).toBeLessThanOrEqual(12);
+      }
+
+      const arr = [10, 20, 30, 40, 50];
+      const shufA = rngA.shuffle(arr);
+      const shufB = rngB.shuffle(arr);
+      expect(shufA).toEqual(shufB);
+      expect(arr).toEqual([10, 20, 30, 40, 50]); // original never mutated
+
+      // Independent trial seeds never depend on execution order
+      expect(deriveTrialSeed("match-seed", 0)).toBe(deriveTrialSeed("match-seed", 0));
+      expect(deriveTrialSeed("match-seed", 1)).not.toBe(deriveTrialSeed("match-seed", 0));
+      expect(() => hashSeed(NaN)).toThrow();
+      expect(() => rngA.nextInt(0)).toThrow();
+      expect(() => rngA.weightedIndex([-1, 2])).toThrow();
+      expect(() => rngA.weightedIndex([0, 0])).toThrow();
+
+      // Standard Fair 2d6 Model
+      const fairModel = new StandardFairDiceModel();
+      expect(fairModel.id).toBe("standard_fair_2d6");
+      expect(fairModel.mode).toBe("random");
+      expect(fairModel.status).toBe("exact_validated");
+      expect(fairModel.isExact).toBe(true);
+
+      const distRes = fairModel.getDistribution();
+      expect(distRes.ok).toBe(true);
+      expect(distRes.diagnostics.isExact).toBe(true);
+      expect(distRes.diagnostics.status).toBe("exact_validated");
+
+      let probSum = 0;
+      for (const s of DICE_SUMS) {
+        const expected = FAIR_2D6_COMBINATION_COUNTS[s] / 36;
+        expect(distRes.probabilities[s]).toBeCloseTo(expected, 12);
+        probSum += distRes.probabilities[s];
+      }
+      expect(probSum).toBeCloseTo(1.0, 12);
+
+      // Reproducible sampling & empirical convergence to exact 2d6 distribution
+      const sampleRng1 = createSeededRng(777);
+      const sampleRng2 = createSeededRng(777);
+      const counts = Object.fromEntries(DICE_SUMS.map((s) => [s, 0])) as Record<number, number>;
+      const N = 18000;
+      for (let i = 0; i < N; i++) {
+        const s1 = fairModel.sampleOutcome(sampleRng1);
+        const s2 = fairModel.sampleOutcome(sampleRng2);
+        expect(s1.ok).toBe(true);
+        expect(s1.outcome).toEqual(s2.outcome);
+        const { d1, d2, total } = s1.outcome!;
+        expect(d1).toBeGreaterThanOrEqual(1);
+        expect(d1).toBeLessThanOrEqual(6);
+        expect(d2).toBeGreaterThanOrEqual(1);
+        expect(d2).toBeLessThanOrEqual(6);
+        expect(d1 + d2).toBe(total);
+        counts[total] += 1;
+      }
+      for (const s of DICE_SUMS) {
+        expect(counts[s] / N).toBeCloseTo(FAIR_2D6_PROBABILITIES[s], 2);
+      }
+    });
+
+    it("2. Balanced Dice Models: metadata, explicit empirical-approximation status, normalization, and fail-closed unknown mode", () => {
+      const shoeModel = new Balanced24Of36ShoeDiceModel();
+      const marginalModel = new BalancedStationaryMarginalDiceModel();
+      const unsupportedModel = new UnsupportedDiceModel();
+
+      // Balanced Dice models must NEVER be labeled exact
+      expect(shoeModel.status).toBe("empirical_approximation");
+      expect(shoeModel.isExact).toBe(false);
+      expect(marginalModel.status).toBe("empirical_approximation");
+      expect(marginalModel.isExact).toBe(false);
+      expect(unsupportedModel.status).toBe("unsupported_mode");
+      expect(unsupportedModel.isExact).toBe(false);
+
+      // Verify probability normalization across empty, mid-cycle, reshuffle-boundary (24 rolls), and misaligned histories
+      const histories: Array<{ hist: number[]; aligned: "aligned" | "misaligned_midgame" | "unknown" }> = [
+        { hist: [], aligned: "aligned" },
+        { hist: [7, 7, 6, 8, 5, 9, 7, 4, 10, 2, 12], aligned: "aligned" },
+        { hist: new Array(24).fill(0).map((_, i) => DICE_SUMS[i % DICE_SUMS.length]), aligned: "aligned" },
+        { hist: [6, 6, 6, 6, 6, 7], aligned: "misaligned_midgame" },
+        { hist: [8, 9, 10], aligned: "unknown" }
+      ];
+
+      for (const { hist, aligned } of histories) {
+        for (const model of [shoeModel, marginalModel]) {
+          const d = model.getDistribution({ rollHistory: hist, alignmentStatus: aligned });
+          expect(d.ok).toBe(true);
+          expect(d.diagnostics.isExact).toBe(false);
+          expect(d.diagnostics.status).toBe("empirical_approximation");
+          expect(d.diagnostics.confidence).toBe("provisional_empirical");
+          expect(d.diagnostics.assumptions.length).toBeGreaterThan(0);
+          expect(d.diagnostics.limitations.length).toBeGreaterThan(0);
+
+          let sum = 0;
+          for (const s of DICE_SUMS) {
+            const p = d.probabilities[s];
+            expect(Number.isFinite(p)).toBe(true);
+            expect(p).toBeGreaterThanOrEqual(0);
+            expect(p).toBeLessThanOrEqual(1);
+            sum += p;
+          }
+          expect(sum).toBeCloseTo(1.0, 12);
+        }
+      }
+
+      // When aligned and 2 occurs once in the current 24-roll cycle, 2 has 0 copies left in the 36-combination shoe
+      const afterTwo = shoeModel.getDistribution({ rollHistory: [2], alignmentStatus: "aligned" });
+      expect(afterTwo.diagnostics.alignmentUsed).toBe(true);
+      expect(afterTwo.diagnostics.cycleRollsUsed).toBe(1);
+      expect(afterTwo.diagnostics.bagRemainingInShoe).toBe(35);
+      expect(afterTwo.probabilities[2]).toBe(0);
+
+      // At exactly 24 rolls, the shoe reshuffles back to 36 combinations
+      const cycle24 = [7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 8, 8, 8, 8, 8, 5, 5, 5, 5, 9, 9, 9, 9];
+      const atReset = shoeModel.getDistribution({ rollHistory: cycle24, alignmentStatus: "aligned" });
+      expect(atReset.diagnostics.cycleRollsUsed).toBe(0);
+      expect(atReset.diagnostics.bagRemainingInShoe).toBe(36);
+      expect(atReset.probabilities[2]).toBeGreaterThan(0);
+
+      // When misaligned midgame, shoeModel must NOT claim cycle alignment
+      const misaligned = shoeModel.getDistribution({ rollHistory: [2], alignmentStatus: "misaligned_midgame" });
+      expect(misaligned.diagnostics.alignmentUsed).toBe(false);
+      expect(misaligned.probabilities[2]).toBeGreaterThan(0);
+
+      // Unknown dice mode must fail closed unless an explicit modelId + allowApproximationForUnknownMode is supplied
+      const failUnknown = resolveDiceModelForRules("unknown");
+      expect(failUnknown.ok).toBe(false);
+      expect(failUnknown.model.status).toBe("unsupported_mode");
+      expect(failUnknown.model.sampleOutcome(createSeededRng(1)).ok).toBe(false);
+
+      const explicitOverride = resolveDiceModelForRules("unknown", {
+        modelId: "balanced_stationary_marginal_approx",
+        allowApproximationForUnknownMode: true
+      });
+      expect(explicitOverride.ok).toBe(true);
+      expect(explicitOverride.model.id).toBe("balanced_stationary_marginal_approx");
+      expect(explicitOverride.model.isExact).toBe(false);
+    });
+
+    it("3. Recording-level empirical dice partitioning and holdout calibration (51 1v1 games vs 2 4P Rush games)", () => {
+      // Partition all 53 recordings by gameSettings (modeSetting, maxPlayers, diceSetting)
+      const oneVOneRollSeqs: number[][] = [];
+      const rush4pRollSeqs: number[][] = [];
+
+      for (const rec of recordings) {
+        const parsed = stateDiffAdapter.parse(decodeFrames(rec.frames).decoded);
+        const gs = parsed.snapshot?.gameSettings;
+        const rolls = parsed.events
+          .filter((e): e is Extract<(typeof parsed.events)[number], { type: "roll" }> => e.type === "roll")
+          .map((e) => e.total);
+        if (gs?.diceSetting === 1 && gs?.modeSetting === 0 && gs?.maxPlayers === 2) {
+          oneVOneRollSeqs.push(rolls);
+        } else if (gs?.diceSetting === 1 && gs?.modeSetting === 12 && gs?.maxPlayers === 4) {
+          rush4pRollSeqs.push(rolls);
+        }
+      }
+
+      // Verify dataset partitioning matches documented empirical summary
+      expect(oneVOneRollSeqs.length).toBe(51);
+      expect(rush4pRollSeqs.length).toBe(2);
+
+      const stats1v1 = computeRollSequenceStats(oneVOneRollSeqs);
+      const statsRush = computeRollSequenceStats(rush4pRollSeqs);
+      expect(stats1v1.totalRolls).toBe(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.standard1v1Balanced.totalRolls);
+      expect(statsRush.totalRolls).toBe(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.rush4pBalanced.totalRolls);
+
+      // 1. Disjoint 36-roll windows frequently violate the 36-combination cap (91/128 in 1v1), falsifying a single 36-card deck
+      expect(stats1v1.disjoint36WindowViolations.violatingWindows).toBeGreaterThan(80);
+      // 2. Disjoint 24-roll windows have ZERO violations across all 51 1v1 games (0/174) and across the 2 Rush games (0/6)
+      expect(stats1v1.disjoint24WindowViolations.violatingWindows).toBe(0);
+      expect(statsRush.disjoint24WindowViolations.violatingWindows).toBe(0);
+      // 3. Consecutive sum repeat rate (lag 1) is significantly suppressed relative to fair 2d6 (7.42% vs 11.27%)
+      expect(stats1v1.lag1RepeatRate).toBeLessThan(0.085);
+
+      // Recording-level holdout evaluation: 35 training games vs 16 held-out test games
+      const holdoutGames = oneVOneRollSeqs.slice(35);
+      expect(holdoutGames.length).toBe(16);
+
+      const fairModel = createDiceModel("standard_fair_2d6");
+      const marginalModel = createDiceModel("balanced_stationary_marginal_approx");
+      const shoeModel = createDiceModel("balanced_24_of_36_shoe_approx");
+
+      const calibration = evaluateDiceModelsOnHoldoutGames([fairModel, marginalModel, shoeModel], holdoutGames, "aligned");
+      const [calFair, calMarginal, calShoe] = calibration;
+
+      expect(calFair.rollsEvaluated).toBe(1144);
+      expect(calFair.isExact).toBe(true);
+      expect(calMarginal.isExact).toBe(false);
+      expect(calShoe.isExact).toBe(false);
+
+      // On the 16 held-out games, the 24-of-36 shoe empirical approximation improves both NLL and Brier over fair 2d6 and stationary marginal
+      expect(calShoe.nllPerRoll).toBeLessThan(calFair.nllPerRoll - 0.08);
+      expect(calShoe.nllPerRoll).toBeLessThan(calMarginal.nllPerRoll - 0.08);
+      expect(calShoe.brierPerRoll).toBeLessThan(calFair.brierPerRoll - 0.01);
+    });
+
+    it("4–8. Hidden-Information Determinization: exact self hands, bounded opponent hands, resource conservation, and dev-card sampling without replacement", () => {
+      // Mid-game state from farm9373 (frame 1000: turnState=2, actionState=0 -> phase 'main')
+      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const { decoded } = decodeFrames(farmRec.frames.slice(0, 1000));
+      const parsed = stateDiffAdapter.parse(decoded);
+      const placements = placementsFrom(parsed.events);
+
+      // Build observed state with HandTracker bounds on opponent c1
+      const baseObs = buildObservedGameState({
+        board: parsed.board!,
+        placements,
+        snapshot: parsed.snapshot,
+        events: parsed.events,
+        selfId: parsed.selfId,
+        warnings: parsed.warnings
+      });
+
+      // Construct an observed state with nontrivial lower/upper resource bounds and face-down dev cards (including 1 bought this turn)
+      const oppOrig = baseObs.playerById["c1"];
+      const selfOrig = baseObs.playerById["c5"];
+      expect(selfOrig.hand.exact).not.toBeNull();
+      expect(selfOrig.hand.inferenceSource).toBe("authoritative");
+
+      const customObs = cloneObservedGameState(baseObs);
+      const mutOpp = customObs.players.find((p) => p.id === "c1")!;
+      // Set opponent handSize = 6, with knownMin: { lumber: 2, brick: 1, wool: 0, grain: 0, ore: 0 }, maxPossible: { lumber: 4, brick: 3, wool: 2, grain: 1, ore: 0 }
+      (mutOpp as { hand: typeof mutOpp.hand }).hand = {
+        exact: null,
+        knownMin: { lumber: 2, brick: 1, wool: 0, grain: 0, ore: 0 },
+        maxPossible: { lumber: 4, brick: 3, wool: 2, grain: 1, ore: 0 },
+        likely: { lumber: 3, brick: 2, wool: 1, grain: 0, ore: 0 },
+        handSize: 6,
+        unknownCount: 3,
+        confidence: "bounded",
+        inferenceSource: "hand_tracker"
+      };
+      // Also give opponent 3 face-down dev cards: 1 bought this turn, 2 playable now, and cap maxUnrevealedVpDevs at 1
+      const bankDevsBefore = customObs.devDeck.unseenTotal;
+      const otherUnknownDevs = selfOrig.devs.unknownInHand;
+      (mutOpp as { devs: typeof mutOpp.devs }).devs = {
+        ...mutOpp.devs,
+        totalInHand: 3,
+        readyActionDevs: [],
+        boughtActionDevsThisTurn: [],
+        confirmedVpDevs: 0,
+        unknownInHand: 3,
+        unknownBoughtThisTurn: 1,
+        unknownPlayableNow: 2
+      };
+      (mutOpp as { vp: typeof mutOpp.vp }).vp = {
+        ...mutOpp.vp,
+        maxUnrevealedVpDevs: 1,
+        maxPossibleVp: mutOpp.vp.totalConfirmedVp + 1
+      };
+      (customObs as { bank: typeof customObs.bank }).bank = {
+        resources: null,
+        totalResourcesLeft: 95 - (selfOrig.hand.handSize + 6),
+        confidence: "hidden_by_settings"
+      };
+      (customObs as { devDeck: typeof customObs.devDeck }).devDeck = {
+        ...customObs.devDeck,
+        bankRemaining: bankDevsBefore - 3 - otherUnknownDevs,
+        bankRemainingConfidence: "authoritative"
+      };
+      (customObs.playerById as Record<string, typeof mutOpp>)["c1"] = mutOpp;
+
+      const snapshotBefore = JSON.stringify({
+        ...customObs,
+        topology: undefined,
+        cornerPiece: Array.from(customObs.cornerPiece)
+      });
+
+      // Sample 40 determinizations under both 'likely_prior' and 'uniform_within_bounds'
+      let totalLumberLikely = 0;
+      let totalLumberUniform = 0;
+      let sawVpDev = false;
+      let sawZeroVpDev = false;
+
+      for (let i = 0; i < 40; i++) {
+        const resLikely = sampleDeterminization(customObs, createSeededRng(1000 + i), {
+          resourceSamplingPolicy: "likely_prior"
+        });
+        expect(resLikely.ok, !resLikely.ok ? resLikely.error.message : "").toBe(true);
+        if (!resLikely.ok) return;
+
+        const resUniform = sampleDeterminization(customObs, createSeededRng(1000 + i), {
+          resourceSamplingPolicy: "uniform_within_bounds"
+        });
+        expect(resUniform.ok, !resUniform.ok ? resUniform.error.message : "").toBe(true);
+        if (!resUniform.ok) return;
+
+        for (const res of [resLikely, resUniform]) {
+          // 1. Concrete state invariant validation (including 19-per-resource and 25-dev-card conservation)
+          const val = validateConcreteSimState(res.state);
+          expect(val.valid, val.errors.join("; ")).toBe(true);
+
+          // 2. Self hand (c5) is preserved identically
+          const simSelf = res.state.players.find((p) => p.id === "c5")!;
+          expect(simSelf.hand).toEqual(selfOrig.hand.exact);
+
+          // 3. Opponent hand (c1) preserves handSize = 6 and respects all knownMin and maxPossible bounds
+          const simOpp = res.state.players.find((p) => p.id === "c1")!;
+          const oppSum = Object.values(simOpp.hand).reduce((a, b) => a + b, 0);
+          expect(oppSum).toBe(6);
+          expect(simOpp.hand.lumber).toBeGreaterThanOrEqual(2);
+          expect(simOpp.hand.lumber).toBeLessThanOrEqual(4);
+          expect(simOpp.hand.brick).toBeGreaterThanOrEqual(1);
+          expect(simOpp.hand.brick).toBeLessThanOrEqual(3);
+          expect(simOpp.hand.wool).toBeGreaterThanOrEqual(0);
+          expect(simOpp.hand.wool).toBeLessThanOrEqual(2);
+          expect(simOpp.hand.grain).toBeGreaterThanOrEqual(0);
+          expect(simOpp.hand.grain).toBeLessThanOrEqual(1);
+          expect(simOpp.hand.ore).toBe(0); // maxPossible.ore === 0 enforced strictly!
+
+          // 4. Dev card allocation: 3 unknown cards partitioned into readyDevs, boughtDevsThisTurn, and vpDevs (<= 1 VP dev)
+          expect(simOpp.readyDevs.length + simOpp.boughtDevsThisTurn.length + simOpp.vpDevs).toBe(3);
+          expect(simOpp.vpDevs).toBeLessThanOrEqual(1); // respects maxUnrevealedVpDevs = 1
+          expect(simOpp.boughtDevsThisTurn.length).toBeLessThanOrEqual(1); // at most 1 card was bought this turn
+          expect(simOpp.readyDevs.length).toBeLessThanOrEqual(2); // at most 2 cards were bought on prior turns
+          expect(res.state.devDeckOrder.length).toBe(bankDevsBefore - 3 - otherUnknownDevs);
+
+          // 5. Epistemic VP separation: observedConfirmedVp never includes sampled opponent VP dev cards
+          expect(simOpp.observedConfirmedVp).toBe(mutOpp.vp.totalConfirmedVp);
+          expect(simOpp.actualSimulatedVp).toBe(simOpp.visibleVp + simOpp.vpDevs);
+          if (simOpp.vpDevs === 1) sawVpDev = true;
+          if (simOpp.vpDevs === 0) sawZeroVpDev = true;
+        }
+
+        totalLumberLikely += resLikely.state.players.find((p) => p.id === "c1")!.hand.lumber;
+        totalLumberUniform += resUniform.state.players.find((p) => p.id === "c1")!.hand.lumber;
+      }
+
+      expect(sawVpDev).toBe(true);
+      expect(sawZeroVpDev).toBe(true);
+      expect(totalLumberLikely).toBeGreaterThanOrEqual(totalLumberUniform);
+
+      // Verify observed state was never mutated across 80 determinization calls
+      expect(
+        JSON.stringify({
+          ...customObs,
+          topology: undefined,
+          cornerPiece: Array.from(customObs.cornerPiece)
+        })
+      ).toBe(snapshotBefore);
+    });
+
+    it("9–10. Determinization diagnostic failures for inconsistent or impossible observed constraints without mutating input", () => {
+      const baseObs = buildMidgameObservedFixture("farm9373", 1000);
+
+      // Case A: sum(knownMin) > handSize
+      const badMinObs = cloneObservedGameState(baseObs);
+      const p1A = badMinObs.players.find((p) => p.id === "c1")!;
+      (p1A as { hand: typeof p1A.hand }).hand = {
+        ...p1A.hand,
+        exact: null,
+        handSize: 3,
+        knownMin: { lumber: 2, brick: 2, wool: 0, grain: 0, ore: 0 },
+        maxPossible: { lumber: 3, brick: 3, wool: 3, grain: 3, ore: 3 }
+      };
+      const resA = sampleDeterminization(badMinObs, createSeededRng(1));
+      expect(resA.ok).toBe(false);
+      if (!resA.ok) {
+        expect(resA.error.code).toBe("inconsistent_resource_constraints");
+      }
+
+      // Case B: sum(maxPossible) < handSize
+      const badMaxObs = cloneObservedGameState(baseObs);
+      const p1B = badMaxObs.players.find((p) => p.id === "c1")!;
+      (p1B as { hand: typeof p1B.hand }).hand = {
+        ...p1B.hand,
+        exact: null,
+        handSize: 5,
+        knownMin: { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 },
+        maxPossible: { lumber: 1, brick: 1, wool: 1, grain: 1, ore: 0 }
+      };
+      const resB = sampleDeterminization(badMaxObs, createSeededRng(1));
+      expect(resB.ok).toBe(false);
+      if (!resB.ok) {
+        expect(resB.error.code).toBe("inconsistent_resource_constraints");
+      }
+
+      // Case C: Global 19-card supply conservation impossible across players + exact bank
+      const badBankObs = cloneObservedGameState(baseObs);
+      (badBankObs as { bank: typeof badBankObs.bank }).bank = {
+        resources: { lumber: 19, brick: 19, wool: 19, grain: 19, ore: 19 },
+        totalResourcesLeft: 95,
+        confidence: "exact"
+      };
+      const resC = sampleDeterminization(badBankObs, createSeededRng(1));
+      expect(resC.ok).toBe(false);
+      if (!resC.ok) {
+        expect(resC.error.code).toBe("resource_conservation_impossible");
+      }
+
+      // Case D: Impossible dev-card counts (unknownInHand exceeds unseenTotal)
+      const badDevObs = cloneObservedGameState(baseObs);
+      const p1D = badDevObs.players.find((p) => p.id === "c1")!;
+      (p1D as { devs: typeof p1D.devs }).devs = {
+        ...p1D.devs,
+        totalInHand: 30,
+        unknownInHand: 30,
+        unknownPlayableNow: 30,
+        unknownBoughtThisTurn: 0
+      };
+      const resD = sampleDeterminization(badDevObs, createSeededRng(1));
+      expect(resD.ok).toBe(false);
+      if (!resD.ok) {
+        expect(resD.error.code).toBe("dev_conservation_impossible");
+      }
+
+      // Case E: Unknown diceMode without explicit diceModeOverride fails closed
+      const unknownDiceObs = cloneObservedGameState(baseObs);
+      (unknownDiceObs as { rules: typeof unknownDiceObs.rules }).rules = {
+        ...unknownDiceObs.rules,
+        diceMode: { setting: undefined, mode: "unknown", source: "unknown" }
+      };
+      const resE = sampleDeterminization(unknownDiceObs, createSeededRng(1));
+      expect(resE.ok).toBe(false);
+      if (!resE.ok) {
+        expect(resE.error.code).toBe("unsupported_dice_mode");
+      }
+      const resEOverride = sampleDeterminization(unknownDiceObs, createSeededRng(1), {
+        diceModeOverride: "balanced"
+      });
+      expect(resEOverride.ok).toBe(true);
+
+      // Case F: Simultaneous Rush setup ('setup_waiting') or 'unknown' phase fails closed
+      const rushWaitObs = cloneObservedGameState(baseObs);
+      (rushWaitObs as { phase: typeof rushWaitObs.phase }).phase = "setup_waiting";
+      const resF = sampleDeterminization(rushWaitObs, createSeededRng(1));
+      expect(resF.ok).toBe(false);
+      if (!resF.ok) {
+        expect(resF.error.code).toBe("unsupported_phase");
+      }
+    });
+
+    it("11–14. Baseline Rollout Engine: reproducibility, legal-action-only execution, immediate win handling, and cutoff/error statuses", () => {
+      const topo = buildMidgameObservedFixture("farm9373", 1000).topology;
+      const initRes = createInitialConcreteState({
+        topology: topo,
+        playerIds: ["c1", "c2"],
+        rules: { victoryPointsToWin: 15, cardDiscardLimit: 9, friendlyRobber: true, diceMode: "balanced" }
+      });
+      expect(initRes.ok).toBe(true);
+      if (!initRes.ok) return;
+      const initialState = initRes.state;
+      const initialSnapshot = JSON.stringify({
+        ...initialState,
+        topology: undefined,
+        cornerPiece: Array.from(initialState.cornerPiece)
+      });
+
+      // 11 & 12. Identical seeds produce identical complete rollouts, every step is legal and passes validateConcreteSimState,
+      // and initialState is never mutated
+      const r1 = runRollout(initialState, createSeededRng(20261010), {
+        validateEveryStep: true,
+        recordTrace: true
+      });
+      const r2 = runRollout(initialState, createSeededRng(20261010), {
+        validateEveryStep: true,
+        recordTrace: true
+      });
+
+      expect(r1.status).toBe("completed");
+      expect(r1.completed).toBe(true);
+      expect(r1.winnerId).toBeDefined();
+      expect(r1.diceModelId).toBe("balanced_24_of_36_shoe_approx");
+      expect(r1.diceModelStatus).toBe("empirical_approximation");
+      expect(r1.diceModelIsExact).toBe(false);
+
+      expect(r2.status).toBe(r1.status);
+      expect(r2.winnerId).toBe(r1.winnerId);
+      expect(r2.actionsSimulated).toBe(r1.actionsSimulated);
+      expect(r2.turnsSimulated).toBe(r1.turnsSimulated);
+      expect(r2.sampledDiceRolls).toEqual(r1.sampledDiceRolls);
+      expect(r2.trace).toEqual(r1.trace);
+      expect(
+        JSON.stringify({
+          ...initialState,
+          topology: undefined,
+          cornerPiece: Array.from(initialState.cornerPiece)
+        })
+      ).toBe(initialSnapshot);
+
+      // 13. Immediate winning-action handling: policy takes an immediate win via buildCity / playKnight without peeking at devDeckOrder
+      const nearWinState = cloneConcreteSimState(r1.finalState);
+      nearWinState.phase = "main";
+      nearWinState.winnerId = undefined;
+      nearWinState.turnPlayerIndex = 0;
+      nearWinState.dice = { thrown: true, d1: 3, d2: 3, total: 6 };
+      const p0 = nearWinState.players[0];
+      const p1 = nearWinState.players[1];
+      // Reset board to a clean 14-VP configuration for c1 with 1 upgradable settlement and city resources in hand
+      nearWinState.cornerOwner.fill(null);
+      nearWinState.cornerPiece.fill(0);
+      nearWinState.edgeOwner.fill(null);
+      nearWinState.cornerOwner[0] = "c1";
+      nearWinState.cornerPiece[0] = 1; // settlement to upgrade
+      nearWinState.cornerOwner[10] = "c2";
+      nearWinState.cornerPiece[10] = 1;
+      p0.settlementsLeft = 4;
+      p0.citiesLeft = 4;
+      p0.roadsLeft = 15;
+      p0.hasLargestArmy = false;
+      p0.hasLongestRoad = false;
+      p0.knightsPlayed = 0;
+      p0.readyDevs = [];
+      p0.boughtDevsThisTurn = [];
+      p0.playedDevs = [];
+      p0.vpDevs = 13; // 1 visible + 13 vpDevs = 14 actualSimulatedVp (needs +1 VP to reach 15)
+      p0.visibleVp = 1;
+      p0.observedConfirmedVp = 14;
+      p0.actualSimulatedVp = 14;
+      p0.hand = { lumber: 2, brick: 2, wool: 1, grain: 2, ore: 3 };
+      p1.settlementsLeft = 4;
+      p1.citiesLeft = 4;
+      p1.roadsLeft = 15;
+      p1.hasLargestArmy = false;
+      p1.hasLongestRoad = false;
+      p1.knightsPlayed = 0;
+      p1.readyDevs = [];
+      p1.boughtDevsThisTurn = [];
+      p1.playedDevs = [];
+      p1.vpDevs = 0;
+      p1.visibleVp = 1;
+      p1.observedConfirmedVp = 1;
+      p1.actualSimulatedVp = 1;
+      p1.hand = { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 };
+      nearWinState.bank = { lumber: 17, brick: 17, wool: 18, grain: 17, ore: 16 };
+      nearWinState.devDeckOrder = [
+        ...new Array(14).fill("knight"),
+        ...new Array(2).fill("roadBuilding"),
+        ...new Array(2).fill("yearOfPlenty"),
+        ...new Array(2).fill("monopoly")
+      ].slice(0, 12) as typeof nearWinState.devDeckOrder;
+      nearWinState.rules.devDeckComposition = {
+        knight: 14,
+        victoryPoint: 13,
+        roadBuilding: 2,
+        yearOfPlenty: 2,
+        monopoly: 2
+      };
+      // Pad devDeckOrder to match devDeckComposition (33 - 13 = 20)
+      while (nearWinState.devDeckOrder.length < 20) nearWinState.devDeckOrder.push("knight");
+
+      expect(validateConcreteSimState(nearWinState).valid).toBe(true);
+      const winActions = getLegalActions(nearWinState, "c1");
+      expect(findImmediateWinningAction(nearWinState, "c1", winActions)).toEqual({
+        type: "buildCity",
+        cornerIndex: 0
+      });
+
+      const winRollout = runRollout(nearWinState, createSeededRng(99));
+      expect(winRollout.status).toBe("completed");
+      expect(winRollout.completed).toBe(true);
+      expect(winRollout.winnerId).toBe("c1");
+      expect(winRollout.actionsSimulated).toBe(1);
+
+      // Verify findImmediateWinningAction does NOT peek at devDeckOrder[0] === 'victoryPoint' for buyDevCard
+      const hiddenDeckWinState = cloneConcreteSimState(nearWinState);
+      hiddenDeckWinState.players[0].hand = { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 };
+      hiddenDeckWinState.bank = { lumber: 19, brick: 19, wool: 18, grain: 18, ore: 18 };
+      hiddenDeckWinState.devDeckOrder[0] = "victoryPoint";
+      hiddenDeckWinState.rules.devDeckComposition = {
+        knight: 13,
+        victoryPoint: 14,
+        roadBuilding: 2,
+        yearOfPlenty: 2,
+        monopoly: 2
+      };
+      const hiddenActions = getLegalActions(hiddenDeckWinState, "c1");
+      expect(hiddenActions.some((a) => a.type === "buyDevCard")).toBe(true);
+      expect(findImmediateWinningAction(hiddenDeckWinState, "c1", hiddenActions)).toBeUndefined();
+
+      // 14. Correct handling of terminal states, cutoffs, unsupported phases, and illegal policy actions
+      const alreadyDone = runRollout(winRollout.finalState, createSeededRng(1));
+      expect(alreadyDone.status).toBe("completed");
+      expect(alreadyDone.completed).toBe(true);
+      expect(alreadyDone.actionsSimulated).toBe(0);
+
+      const maxActionsRes = runRollout(initialState, createSeededRng(1), { maxActions: 5 });
+      expect(maxActionsRes.status).toBe("max_actions_reached");
+      expect(maxActionsRes.completed).toBe(false);
+      expect(maxActionsRes.winnerId).toBeUndefined();
+      expect(maxActionsRes.actionsSimulated).toBe(5);
+
+      const maxTurnsRes = runRollout(initialState, createSeededRng(1), { maxTurns: 2 });
+      expect(maxTurnsRes.status).toBe("max_turns_reached");
+      expect(maxTurnsRes.completed).toBe(false);
+      expect(maxTurnsRes.winnerId).toBeUndefined();
+      expect(maxTurnsRes.turnsSimulated).toBe(2);
+
+      const badPhaseState = cloneConcreteSimState(initialState);
+      (badPhaseState as { phase: string }).phase = "setup_waiting";
+      const badPhaseRes = runRollout(badPhaseState, createSeededRng(1));
+      expect(badPhaseRes.status).toBe("unsupported_phase");
+      expect(badPhaseRes.completed).toBe(false);
+
+      const illegalPolicy: RolloutPolicy = {
+        id: "illegal_test_policy",
+        selectAction: () => ({ type: "endTurn" }) // illegal during setup_settlement
+      };
+      const illegalPolicyRes = runRollout(initialState, createSeededRng(1), { policy: illegalPolicy });
+      expect(illegalPolicyRes.status).toBe("unsupported_action");
+      expect(illegalPolicyRes.completed).toBe(false);
+    });
+
+    it("15–16. Batch determinized rollouts, incomplete-trial accounting, model comparison, and Stage 3.3 performance benchmarks", () => {
+      const midgameObs = buildMidgameObservedFixture("farm9373", 1000);
+      expect(validateObservedState(midgameObs).valid).toBe(true);
+
+      // Run batch under both Balanced Dice empirical approximations and verify reproducibility
+      const batchA1 = runDeterminizedRollouts(midgameObs, {
+        numTrials: 12,
+        baseSeed: "stage-3.3-batch-seed",
+        rolloutOptions: { diceModelId: "balanced_24_of_36_shoe_approx" }
+      });
+      const batchA2 = runDeterminizedRollouts(midgameObs, {
+        numTrials: 12,
+        baseSeed: "stage-3.3-batch-seed",
+        rolloutOptions: { diceModelId: "balanced_24_of_36_shoe_approx" }
+      });
+      expect(batchA1).toEqual(batchA2);
+      expect(batchA1.determinizationSuccessCount).toBe(12);
+      expect(batchA1.determinizationFailureCount).toBe(0);
+      expect(batchA1.failedRolloutCount).toBe(0);
+      expect(batchA1.completedCount + batchA1.cutoffCount).toBe(12);
+      expect(batchA1.completedCount).toBeGreaterThan(0);
+      expect(batchA1.diceModelIsExact).toBe(false);
+      expect(batchA1.diceModelStatus).toBe("empirical_approximation");
+
+      const sumWins = Object.values(batchA1.winsByPlayerId).reduce((a, b) => a + b, 0);
+      expect(sumWins).toBe(batchA1.completedCount);
+
+      const batchStationary = runDeterminizedRollouts(midgameObs, {
+        numTrials: 12,
+        baseSeed: "stage-3.3-batch-seed",
+        rolloutOptions: { diceModelId: "balanced_stationary_marginal_approx" }
+      });
+      expect(batchStationary.diceModelId).toBe("balanced_stationary_marginal_approx");
+      expect(batchStationary.determinizationSuccessCount).toBe(12);
+
+      // Verify cutoff trials are NEVER folded into wins or losses
+      const cutoffBatch = runDeterminizedRollouts(midgameObs, {
+        numTrials: 6,
+        baseSeed: 555,
+        rolloutOptions: { maxTurns: 1 }
+      });
+      expect(cutoffBatch.determinizationSuccessCount).toBe(6);
+      expect(cutoffBatch.completedCount).toBe(0);
+      expect(cutoffBatch.cutoffCount).toBe(6);
+      expect(cutoffBatch.maxTurnsCutoffCount).toBe(6);
+      expect(cutoffBatch.winsByPlayerId["c1"]).toBe(0);
+      expect(cutoffBatch.winsByPlayerId["c5"]).toBe(0);
+      expect(cutoffBatch.winRateAmongCompletedByPlayerId["c1"]).toBeNull();
+      expect(cutoffBatch.winRateAmongCompletedByPlayerId["c5"]).toBeNull();
+      expect(cutoffBatch.completionRate).toBe(0);
+
+      // Measure Stage 3.3 determinization time, completed rollout throughput, and rollout length distribution
+      const numBenchTrials = 20;
+      let detTotalMs = 0;
+      let completedRolloutMs = 0;
+      let cutoffRolloutMs = 0;
+      const completedTurnsList: number[] = [];
+      const completedActionsList: number[] = [];
+
+      for (let i = 0; i < numBenchTrials; i++) {
+        const rng = createSeededRng(deriveTrialSeed("bench-stage-3.3", i));
+        const tDet0 = performance.now();
+        const det = sampleDeterminization(midgameObs, rng.fork("det"));
+        const tDet1 = performance.now();
+        detTotalMs += tDet1 - tDet0;
+        expect(det.ok).toBe(true);
+        if (!det.ok) continue;
+
+        const tRoll0 = performance.now();
+        const roll = runRollout(det.state, rng.fork("roll"), {
+          validateEveryStep: false,
+          initialRollHistory: midgameObs.dice.observedRolls,
+          diceAlignmentStatus: midgameObs.dice.alignmentStatus
+        });
+        const tRoll1 = performance.now();
+
+        if (roll.completed) {
+          completedRolloutMs += tRoll1 - tRoll0;
+          completedTurnsList.push(roll.turnsSimulated);
+          completedActionsList.push(roll.actionsSimulated);
+        } else {
+          cutoffRolloutMs += tRoll1 - tRoll0;
+        }
+      }
+
+      const sortedTurns = [...completedTurnsList].sort((a, b) => a - b);
+      const sortedActions = [...completedActionsList].sort((a, b) => a - b);
+      const median = (arr: number[]) => (arr.length ? arr[Math.floor(arr.length / 2)] : 0);
+      const avgDetUs = (detTotalMs * 1000) / numBenchTrials;
+      const avgRolloutMs = completedTurnsList.length > 0 ? completedRolloutMs / completedTurnsList.length : 0;
+      const rolloutsPerSec = avgRolloutMs > 0 ? 1000 / avgRolloutMs : 0;
+
+      console.log(
+        `[Stage 3.3 Benchmarks (${numBenchTrials} trials from farm9373 midgame)] ` +
+          `determinization: ${avgDetUs.toFixed(1)} µs/sample | ` +
+          `completed: ${completedTurnsList.length}/${numBenchTrials} (${avgRolloutMs.toFixed(2)} ms/rollout, ${rolloutsPerSec.toFixed(1)} rollouts/sec) | ` +
+          `turns simulated [min=${sortedTurns[0]}, median=${median(sortedTurns)}, max=${sortedTurns[sortedTurns.length - 1]}] | ` +
+          `actions simulated [min=${sortedActions[0]}, median=${median(sortedActions)}, max=${sortedActions[sortedActions.length - 1]}] | ` +
+          `cutoffMs=${cutoffRolloutMs.toFixed(2)} ms`
+      );
+    });
+  });
 });
+
 

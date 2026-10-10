@@ -630,8 +630,19 @@ export function buildObservedGameState(input: ObservedStateInput): ObservedGameS
   };
 
   for (const sp of input.snapshot?.players ?? []) {
-    for (const c of sp.devCards ?? []) decUnseen(c);
-    for (const c of sp.devsPlayedCards ?? []) decUnseen(c);
+    const ownedVpFromCards = (sp.devCards ?? []).filter((c) => c === "victoryPoint").length;
+    const confirmedVp = Math.max(sp.hiddenVp ?? 0, ownedVpFromCards);
+    for (let i = 0; i < confirmedVp; i++) decUnseen("victoryPoint");
+    for (const c of sp.devCards ?? []) {
+      if (c !== "victoryPoint") decUnseen(c);
+    }
+
+    const playedKnightsFromCards = (sp.devsPlayedCards ?? []).filter((c) => c === "knight").length;
+    const confirmedPlayedKnights = Math.max(sp.knights ?? 0, playedKnightsFromCards);
+    for (let i = 0; i < confirmedPlayedKnights; i++) decUnseen("knight");
+    for (const c of sp.devsPlayedCards ?? []) {
+      if (c !== "knight") decUnseen(c);
+    }
   }
   if (!input.snapshot && input.events) {
     for (const e of input.events) {
@@ -929,13 +940,19 @@ export function buildObservedGameState(input: ObservedStateInput): ObservedGameS
       }
       return actions;
     })();
-    const totalInHand = snap?.devsInHand ?? readSide?.devsHidden ?? identifiedOwned.length;
-    const unknownInHand = snap?.unknownDevsInHand ?? Math.max(0, totalInHand - identifiedOwned.length);
+    const confirmedInHandCount = readyActionDevs.length + boughtActionDevsThisTurn.length + confirmedVpDevs;
+    const totalInHand = snap?.devsInHand ?? readSide?.devsHidden ?? confirmedInHandCount;
+    const unknownInHand = snap?.unknownDevsInHand ?? Math.max(0, totalInHand - confirmedInHandCount);
     const unknownBoughtThisTurn = Math.min(unknownInHand, snap?.unknownDevsBoughtThisTurn ?? 0);
     const unknownPlayableNow = Math.max(0, unknownInHand - unknownBoughtThisTurn);
-    const playedCards = snap?.devsPlayedCards ?? readSide?.devsPlayed ?? [];
-    const playedCount = snap?.devsPlayed ?? playedCards.length;
-    const knightsPlayed = snap?.knights ?? readSide?.knights ?? playedCards.filter((c) => c === "knight").length;
+    const rawPlayedCards = snap?.devsPlayedCards ?? readSide?.devsPlayed ?? [];
+    const knightsPlayed = snap?.knights ?? readSide?.knights ?? rawPlayedCards.filter((c) => c === "knight").length;
+    const playedCards: DevCardKind[] = [...rawPlayedCards];
+    const existingPlayedKnights = playedCards.filter((c) => c === "knight").length;
+    for (let i = existingPlayedKnights; i < knightsPlayed; i++) {
+      playedCards.push("knight");
+    }
+    const playedCount = Math.max(snap?.devsPlayed ?? 0, playedCards.length);
     const hasUsedDevThisTurn = snap?.hasUsedDevThisTurn === true;
     const devsConfidence: ObservedDevState["confidence"] =
       snap !== undefined
