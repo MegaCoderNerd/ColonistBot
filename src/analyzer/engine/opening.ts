@@ -1,20 +1,59 @@
 // Recovered from content.js (lines 1988-2085)
 import { pips } from "../replay";
+import type { GameSnapshot } from "../snapshot";
 import { contextFor, isLegal, occupiedMap, planOpening, type BoardContext, type OpeningMode, type OpeningPlan } from "../strategy";
-import type { Board, Placements, PortKind } from "../types";
+import type { Board, GameEvent, Placements, PortKind } from "../types";
 import { applyPort, newPlayer, payValue, pipOf, race, type SimPlayer, type SimProd } from "./sim";
+import type { ShadowEvaluationReport, ShadowRolloutConfig } from "./shadow";
+import type { ObservedGameState } from "./state";
 
-export function coachedOpening(board: Board, placements: Placements, me: string, limit = 3, myTurn: boolean | undefined = undefined): OpeningPlan {
+export interface OpeningShadowOptions extends ShadowRolloutConfig {
+  readonly snapshot?: GameSnapshot;
+  readonly events?: GameEvent[];
+  readonly observedStateOverride?: ObservedGameState;
+}
+
+type OpeningShadowEvaluator = (
+  board: Board,
+  placements: Placements,
+  me: string,
+  plan: OpeningPlan,
+  config?: OpeningShadowOptions
+) => ShadowEvaluationReport;
+
+let openingShadowEvaluator: OpeningShadowEvaluator | undefined;
+
+export function registerOpeningShadowEvaluator(fn: OpeningShadowEvaluator): void {
+  openingShadowEvaluator = fn;
+}
+
+export function coachedOpening(
+  board: Board,
+  placements: Placements,
+  me: string,
+  limit = 3,
+  myTurn: boolean | undefined = undefined,
+  shadowRollout?: OpeningShadowOptions
+): OpeningPlan {
   const wide = planOpening(board, placements, me, Math.max(limit, 8), myTurn);
-  if (wide.mode === "waiting" || wide.picks.length < 2) return { ...wide, picks: wide.picks.slice(0, limit) };
-  const ctx = contextFor(board);
-  const rated = wide.picks.slice(0, 8).map((pick) => ({
-    pick,
-    sim: ratePick(ctx, board, placements, me, pick.at, pick.followUp?.at, wide.oppWants.map((w) => w.at), wide.mode)
-  }));
-  rated.sort((a, b) => b.pick.score - a.pick.score || b.sim.win - a.sim.win || a.sim.turns - b.sim.turns);
-  const picks = rated.slice(0, limit).map((r) => r.pick);
-  return { ...wide, picks };
+  let basePlan: OpeningPlan;
+  if (wide.mode === "waiting" || wide.picks.length < 2) {
+    basePlan = { ...wide, picks: wide.picks.slice(0, limit) };
+  } else {
+    const ctx = contextFor(board);
+    const rated = wide.picks.slice(0, 8).map((pick) => ({
+      pick,
+      sim: ratePick(ctx, board, placements, me, pick.at, pick.followUp?.at, wide.oppWants.map((w) => w.at), wide.mode)
+    }));
+    rated.sort((a, b) => b.pick.score - a.pick.score || b.sim.win - a.sim.win || a.sim.turns - b.sim.turns);
+    const picks = rated.slice(0, limit).map((r) => r.pick);
+    basePlan = { ...wide, picks };
+  }
+  if (shadowRollout?.enabled !== true || !openingShadowEvaluator) {
+    return basePlan;
+  }
+  const shadowEvaluation = openingShadowEvaluator(board, placements, me, basePlan, shadowRollout);
+  return { ...basePlan, shadowEvaluation };
 }
 
 const cache = new Map<string, { win: number; turns: number }>();

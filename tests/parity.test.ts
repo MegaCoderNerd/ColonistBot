@@ -51,13 +51,26 @@ function splitModules(bundle: string): Map<string, string> {
   return map;
 }
 
-const STAGE_2_MODIFIED_MODULES = new Set([
+const STAGE_2_AND_3_MODIFIED_MODULES = new Set([
   "// src/analyzer/snapshot.ts",
   "// src/analyzer/adapters/stateDiff.ts",
   "// src/analyzer/engine/decide.ts",
   "// src/analyzer/engine/roads.ts",
   "// src/analyzer/adapters/logText.ts",
-  "// src/analyzer/engine/sim.ts"
+  "// src/analyzer/engine/sim.ts",
+  "// src/analyzer/engine/rng.ts",
+  "// src/analyzer/engine/opening.ts",
+  "// src/extension/helper.ts"
+]);
+
+const STAGE_3_NEW_MODULES = new Set([
+  "// src/analyzer/engine/topology.ts",
+  "// src/analyzer/engine/state.ts",
+  "// src/analyzer/engine/transition.ts",
+  "// src/analyzer/engine/determinize.ts",
+  "// src/analyzer/engine/diceModel.ts",
+  "// src/analyzer/engine/rollout.ts",
+  "// src/analyzer/engine/shadow.ts"
 ]);
 
 describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () => {
@@ -69,19 +82,21 @@ describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () =>
     }
   });
 
-  it("preserves identical module order (all 34 src/ modules) and 100% AST/token parity on all 28 untouched modules in dist/firefox/content.js", () => {
+  it("preserves identical relative module order for all 34 original src/ modules, includes the 7 Stage 3 engine modules, and preserves 100% AST/token parity on all untouched original modules in dist/firefox/content.js", () => {
     const base = normalizeBundle(readFileSync(resolve(ROOT, "content.js"), "utf8"));
     const built = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
     const baseHeaders = base.split("\n").filter((l) => l.startsWith("  // src/"));
     const builtHeaders = built.split("\n").filter((l) => l.startsWith("  // src/"));
-    expect(builtHeaders).toEqual(baseHeaders);
-    expect(builtHeaders.length).toBe(34);
+    const builtOriginalHeaders = builtHeaders.filter((l) => !STAGE_3_NEW_MODULES.has(l.trim()));
+    expect(builtOriginalHeaders).toEqual(baseHeaders);
+    expect(baseHeaders.length).toBe(34);
+    expect(builtHeaders.length).toBe(34 + STAGE_3_NEW_MODULES.size);
 
     const baseMods = splitModules(base.replace("\n    void extra;", ""));
     const builtMods = splitModules(built);
 
     for (const [header, baseCode] of baseMods.entries()) {
-      if (STAGE_2_MODIFIED_MODULES.has(header)) continue;
+      if (STAGE_2_AND_3_MODIFIED_MODULES.has(header)) continue;
       const builtCode = builtMods.get(header);
       expect(builtCode, `Missing module ${header}`).toBeDefined();
       if (header === "__preamble__") {

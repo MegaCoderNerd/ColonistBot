@@ -6,6 +6,7 @@ import { adviseRoad, listOpenEdges, roadToward } from "../analyzer/engine/roads"
 import { bestEdge, nextRollText, positionWin, sevensText } from "../analyzer/engine/value";
 import { bagAligned } from "../analyzer/engine/read";
 import { planTurn, type TurnPlan } from "../analyzer/engine/decide";
+import { evaluateCandidatesShadow, type ShadowEvaluationReport, type ShadowRolloutConfig } from "../analyzer/engine/shadow";
 import { portAccess } from "../analyzer/engine/ports";
 import { decodeFrames, type DecodedFrame } from "../analyzer/decode";
 import { stateDiffAdapter } from "../analyzer/adapters/stateDiff";
@@ -18,6 +19,10 @@ import { RESOURCES, type Resource, type ResourceHand } from "../analyzer/types";
 import type { MapView, WsFrame } from "../shared/schema";
 
 // [RECONSTRUCTED TYPE DECLARATIONS]
+export interface HelperOptions {
+  shadowRollout?: ShadowRolloutConfig;
+}
+
 export interface HelperContext {
   meName?: string;
   logNames: string[];
@@ -42,6 +47,7 @@ export interface HelperView {
   mapRoadLater?: boolean;
   choose?: string[];
   debug?: string;
+  shadowEvaluation?: ShadowEvaluationReport;
 }
 
 const MAX_FRAMES = 4000;
@@ -63,7 +69,7 @@ function neededResources(v: PlayerHandView): Resource[] {
   return best ?? [];
 }
 
-export function createHelper(friendlyBelow = 3) {
+export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
   let frames: DecodedFrame[] = [];
   let result: ReturnType<typeof pickPrimary> | undefined;
   let dirty = false;
@@ -206,14 +212,51 @@ export function createHelper(friendlyBelow = 3) {
         why = "The page hook is running but Colonist has not opened a game connection yet. Join or start a game; if you are already in one, reload the tab.";
       else if (seen === 0) why = `Colonist opened ${ctx.hook?.sockets ?? 0} connection(s) but no messages reached the helper. Reload the Colonist tab once.`;
       else why = "The board is only sent when the game loads, and this tab missed it. Reload the Colonist tab once (the game rejoins and the board is sent again).";
-      return { title, lines: ["No placement hints yet.", why, diag], choose: who.choose, debug };
+      const shadowEvaluation =
+        options?.shadowRollout?.enabled === true
+          ? evaluateCandidatesShadow(
+              {
+                board: undefined,
+                placements,
+                me: who.id,
+                snapshot: result?.snapshot,
+                events: result?.events
+              },
+              { source: "custom", headline: "No placement hints yet." },
+              [],
+              options.shadowRollout
+            )
+          : undefined;
+      return {
+        title,
+        lines: ["No placement hints yet.", why, diag],
+        choose: who.choose,
+        debug,
+        ...(shadowEvaluation ? { shadowEvaluation } : {})
+      };
     }
     if (!who.id) {
+      const shadowEvaluation =
+        options?.shadowRollout?.enabled === true
+          ? evaluateCandidatesShadow(
+              {
+                board: result.board,
+                placements,
+                me: undefined,
+                snapshot: result.snapshot,
+                events: result.events
+              },
+              { source: "custom", headline: "Not advising until you pick who you are." },
+              [],
+              options.shadowRollout
+            )
+          : undefined;
       return {
         title,
         lines: ["Not advising until you pick who you are.", ...who.notes, "Hints need to know which player you are.", diag],
         choose: who.choose ?? (ctx.logNames.length >= 2 ? ctx.logNames : undefined),
-        debug
+        debug,
+        ...(shadowEvaluation ? { shadowEvaluation } : {})
       };
     }
     const mine = [...placements.settlements.values(), ...placements.cities.values()].filter((o) => o === who.id).length;
@@ -221,13 +264,38 @@ export function createHelper(friendlyBelow = 3) {
     if (logged > mine) behindSince ||= now;
     else behindSince = 0;
     if (behindSince && now - behindSince > STALE_AFTER_MS) {
+      const shadowEvaluation =
+        options?.shadowRollout?.enabled === true
+          ? evaluateCandidatesShadow(
+              {
+                board: result.board,
+                placements,
+                me: who.id,
+                snapshot: result.snapshot,
+                events: result.events
+              },
+              { source: "custom", headline: "The board data is behind the game." },
+              [],
+              {
+                ...options.shadowRollout,
+                staleStateCheck: {
+                  isStale: true,
+                  behindMs: now - behindSince,
+                  staleThresholdMs: STALE_AFTER_MS,
+                  loggedSettlementsByMe: logged,
+                  observedBuildingsByMe: mine
+                }
+              }
+            )
+          : undefined;
       return {
         title,
         lines: [
           `The board data is behind the game: the log shows ${logged} settlement${logged === 1 ? "" : "s"} by you, the network data only ${mine}. Hints are paused so they cannot mislead you.`,
           "Reload the Colonist tab once; the game rejoins and sends the board again."
         ],
-        debug
+        debug,
+        ...(shadowEvaluation ? { shadowEvaluation } : {})
       };
     }
     const robberNow = () => {
@@ -242,6 +310,7 @@ export function createHelper(friendlyBelow = 3) {
     const lines = [`Advising: ${nameOf(who.id)}.${who.confident ? "" : " This match is a guess; set your username in the popup if it is not you."}`];
     const sections: Array<{ title: string; lines: string[] }> = [];
     let coach: CoachAdvice | undefined;
+    let shadowEvaluation: ShadowEvaluationReport | undefined;
     const marks: MapMark[] = [];
     let svg: string | undefined;
     let picks: OpeningPick[] = [];
@@ -249,8 +318,23 @@ export function createHelper(friendlyBelow = 3) {
     if (opening) {
       const myTurn = result.turnPlayer ? result.turnPlayer === who.id : undefined;
       const key = JSON.stringify([[...placements.settlements], [...placements.cities], who.id, myTurn]);
-      if (planMemo?.key !== key) planMemo = { key, plan: coachedOpening(board, placements, who.id, 3, myTurn) };
+      if (planMemo?.key !== key) {
+        planMemo = {
+          key,
+          plan: coachedOpening(
+            board,
+            placements,
+            who.id,
+            3,
+            myTurn,
+            options?.shadowRollout?.enabled === true
+              ? { ...options.shadowRollout, snapshot: result.snapshot, events: result.events }
+              : undefined
+          )
+        };
+      }
       const plan = planMemo.plan;
+      shadowEvaluation = plan.shadowEvaluation;
       const boardCtx = contextFor(board);
       const ports = portAccess(
         boardCtx,
@@ -399,11 +483,13 @@ export function createHelper(friendlyBelow = 3) {
             events: result.events,
             oppNeeds: needs,
             oppHand: oppCounted?.hand,
-            oppUnknown: oppCounted?.unknown
+            oppUnknown: oppCounted?.unknown,
+            shadowRollout: options?.shadowRollout?.enabled === true ? options.shadowRollout : undefined
           })
         };
       }
       const turn = midMemo.plan;
+      shadowEvaluation = turn.shadowEvaluation;
       coach = {
         phase: "midgame",
         headline: turn.headline,
@@ -466,7 +552,8 @@ export function createHelper(friendlyBelow = 3) {
       mapMarks: marks.some((m) => m.kind !== "road"),
       mapRoads: marks.some((m) => m.kind === "road" && !m.later),
       mapRoadLater: marks.some((m) => m.kind === "road" && m.later),
-      debug
+      debug,
+      ...(shadowEvaluation ? { shadowEvaluation } : {})
     };
   }
 

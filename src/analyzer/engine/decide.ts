@@ -9,6 +9,14 @@ import { portAccess, type PortAccessItem } from "./ports";
 import { bagAligned, canBuild, chooseSettlement, cityPick, holdingResource, rankLiveSpots, situationBrief, worthTheRoad, type RankedLiveSpot } from "./read";
 import { longestExtensions, networkLength, roadToward } from "./roads";
 import { bestEdge, mostLikelyRolls, nextRollText, positionWin, sevensText } from "./value";
+import {
+  evaluateCandidatesShadow,
+  type LegacyRecommendationSummary,
+  type LegacyTurnActionCandidate,
+  type LegacyTurnActionId,
+  type ShadowEvaluationReport,
+  type ShadowRolloutConfig
+} from "./shadow";
 
 // [RECONSTRUCTED TYPE DECLARATIONS]
 export interface TurnPlanInput {
@@ -23,6 +31,7 @@ export interface TurnPlanInput {
   oppNeeds?: Resource[];
   oppHand?: ResourceHand;
   oppUnknown?: number;
+  shadowRollout?: ShadowRolloutConfig;
 }
 
 export interface TurnPlan {
@@ -35,6 +44,7 @@ export interface TurnPlan {
   road?: { edge: string; toward?: string; buildNow: boolean; reason: string };
   road2?: { edge: string; toward?: string; reason: string };
   roadLater?: { edge: string; reason: string };
+  shadowEvaluation?: ShadowEvaluationReport;
 }
 
 const LABEL: Record<Resource, string> = { lumber: "wood", brick: "brick", wool: "sheep", grain: "wheat", ore: "ore" };
@@ -182,6 +192,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const discardLimit = meSnap?.discardLimit ?? input.snapshot?.gameSettings?.cardDiscardLimit ?? 9;
   if (action === "yop" && !rolled && known && total(hand) + 2 > discardLimit) action = canCity ? "city" : cityClose ? "cityTrade" : "hold";
   const edgePick = bestEdge(input.board, input.placements, input.me, { rolls: seenRolls, aligned: alignedBag, hand, maxDist: 2 });
+  const legacyCandidateWinPcts = new Map<string, number>();
   const locked = action === "army" || action === "knight" || action === "yop" || action === "roadBuild" || action === "burst" || action === "trophy" || action === "trophy2" || action === "port";
   if (!locked && known) {
     const heAheadKnights = (oppSnap?.knights ?? 0) > (meSnap?.knights ?? 0) || (oppSnap?.army ?? 0) > (meSnap?.army ?? meSnap?.knights ?? 0);
@@ -227,6 +238,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
         pay(COSTS.road);
       } else if (id === "dev") pay(COSTS.dev);
       const pct = positionWin(input.board, placed, input.me, { hand: next, myVp: vp, hisVp, ratios, rollCount: seenRolls.length + 20 + rank[id] });
+      legacyCandidateWinPcts.set(id, pct);
       const cards = total(next);
       if (pct > bestPct || (pct === bestPct && (rank[id] < rank[bestId] || (rank[id] === rank[bestId] && cards < bestCards)))) {
         bestId = id;
@@ -383,13 +395,17 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const dice = input.snapshot?.dice;
   const safeRoll = rolled && dice?.d1 !== undefined && dice.d2 !== undefined && dice.d1 + dice.d2 !== 7;
   const sevenMode = mostLikelyRolls(seenFaces, alignedBag).includes(7);
+  let isPreRollDropWarning = false;
+  let isSpendDownOverride = false;
   if (known && total(hand) > discardLimit && !rolled) {
+    isPreRollDropWarning = true;
     const dropped = cardsToDrop(hand, own, keepFor(hand, own, action), Math.floor(total(hand) / 2));
     headline = dropSentence(dropped, hand, keepFor(hand, own, action));
     why = `You hold ${total(hand)} cards and you have not rolled, so nothing can be placed first. A 7 makes you drop ${Math.floor(total(hand) / 2)}. ${sevensText(seenFaces, alignedBag, input.me)} ${why}`;
   } else if (known && total(hand) > discardLimit && safeRoll) {
     const spent = spendDown(hand, ratios, own, action, discardLimit, spotName);
     if (spent) {
+      isSpendDownOverride = true;
       headline = spent;
       why = `${spent} ${sevensText(seenFaces, alignedBag, input.me)} ${why}`;
     }
@@ -410,6 +426,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
     const spendAction = action === "hold" ? (canPay(hand, COSTS.road) ? "road" : canPay(hand, COSTS.dev) ? "buyDev" : action) : action;
     const spent = spendDown(hand, ratios, own, spendAction, discardLimit, spotName);
     if (spent) {
+      isSpendDownOverride = true;
       headline = spent;
       why = `${spent} ${sevensText(seenFaces, alignedBag, input.me)} ${why}`;
     }
@@ -420,6 +437,10 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const oppSize = input.oppHand && (input.oppUnknown ?? 0) === 0 && total(input.oppHand) > 0 ? total(input.oppHand) : oppSnap?.handSize ?? 0;
   const playMono = Boolean(mono && (oppSize >= 6 || oppCanCity));
   const spendsDev = action === "yop" || action === "roadBuild" || action === "army" || action === "knight";
+  const isMonopolyOverride = Boolean(mono && playMono && !spendsDev);
+  const isMonopolyCompound =
+    isMonopolyOverride &&
+    (action === "city" || action === "cityTrade" || action === "burst" || action === "settle" || action === "settleTrade");
   if (mono && playMono && !spendsDev) {
     const call = `Play Monopoly on ${LABEL[mono.resource]}.`;
     if (action === "city" || action === "cityTrade" || action === "burst" || action === "settle" || action === "settleTrade") {
@@ -521,7 +542,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
     { title: "Next roll", why: nextRoll },
     { title: "A 7", why: sevenLine }
   );
-  return {
+  const basePlan: TurnPlan = {
     headline,
     why,
     race: `About ${pct}% from here. ${nextRoll} You have ${myVp} VP, he has ${hisVp}. First to ${goal}. Buildings alone stop at 13, so the last points are the army, the road, or a dev card.${phase}${raceLead}${(oppSnap?.unknownDevsInHand ?? oppSnap?.devsInHand ?? 0) > 0 ? " He holds a dev card, and one in five is a hidden point." : ""}`,
@@ -538,6 +559,64 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
     road,
     road2,
     roadLater
+  };
+
+  if (input.shadowRollout?.enabled !== true) {
+    return basePlan;
+  }
+
+  const { legacySummary, candidates } = buildShadowTurnCandidates({
+    action: action as LegacyTurnActionId,
+    headline,
+    pct,
+    rolled,
+    known,
+    hand,
+    cards,
+    roadsLeft,
+    canCity,
+    canPlaceNow,
+    canPayRoad,
+    roadTrade,
+    trophy1,
+    city,
+    touching,
+    spot,
+    edgePick,
+    firstStep,
+    secondStep,
+    extension,
+    nearPort,
+    portStep,
+    yopCards,
+    mono,
+    isPreRollDropWarning,
+    isSpendDownOverride,
+    isMonopolyOverride,
+    isMonopolyCompound,
+    legacyCandidateWinPcts
+  });
+
+  const shadowEvaluation = evaluateCandidatesShadow(
+    {
+      board: input.board,
+      placements: input.placements,
+      me: input.me,
+      snapshot: input.snapshot,
+      events: input.events,
+      hand: input.hand,
+      handKnown: input.handKnown,
+      oppHand: input.oppHand,
+      oppUnknown: input.oppUnknown
+    },
+    legacySummary,
+    candidates,
+    input.shadowRollout
+  );
+
+  return {
+    ...basePlan,
+    shadowEvaluation
   };
 }
 
@@ -1010,3 +1089,345 @@ export function robberHits(ctx: BoardContext, placements: Placements, me: string
   }
   return false;
 }
+
+interface ShadowCandidateBuildContext {
+  action: LegacyTurnActionId;
+  headline: string;
+  pct: number;
+  rolled: boolean;
+  known: boolean;
+  hand: ResourceHand;
+  cards: DevCardKind[];
+  roadsLeft: boolean;
+  canCity: boolean;
+  canPlaceNow: boolean;
+  canPayRoad: boolean;
+  roadTrade: boolean;
+  trophy1: boolean;
+  city?: { at: string; name: string; gain: number };
+  touching?: RankedLiveSpot;
+  spot?: RankedLiveSpot;
+  edgePick?: { edge: string; toward?: string; score: number };
+  firstStep?: { edge: string; toward?: string };
+  secondStep?: { edge: string; toward?: string; reason: string };
+  extension?: { edge: string; to: string; len?: number };
+  nearPort?: PortAccessItem;
+  portStep?: { edge: string; dist: number };
+  yopCards?: Resource[];
+  mono?: { resource: Resource; why: string };
+  isPreRollDropWarning: boolean;
+  isSpendDownOverride: boolean;
+  isMonopolyOverride: boolean;
+  isMonopolyCompound: boolean;
+  legacyCandidateWinPcts: Map<string, number>;
+}
+
+function buildShadowTurnCandidates(ctx: ShadowCandidateBuildContext): {
+  legacySummary: LegacyRecommendationSummary;
+  candidates: LegacyTurnActionCandidate[];
+} {
+  const candidates: LegacyTurnActionCandidate[] = [];
+  const seenIds = new Set<string>();
+
+  const pushCandidate = (
+    c: Omit<LegacyTurnActionCandidate, "kind" | "legacyRank">
+  ) => {
+    if (seenIds.has(c.candidateId)) return;
+    seenIds.add(c.candidateId);
+    candidates.push({
+      kind: "turn_action",
+      ...c,
+      legacyRank: candidates.length
+    });
+  };
+
+  const makeCandidateForAction = (
+    actId: LegacyTurnActionId,
+    isPrimary: boolean
+  ): Omit<LegacyTurnActionCandidate, "kind" | "legacyRank"> | undefined => {
+    switch (actId) {
+      case "burst":
+        return {
+          candidateId: "turn_burst",
+          actionId: "burst",
+          label: isPrimary ? ctx.headline : "Settle and city on the same turn",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: ctx.pct,
+          at: ctx.touching?.at
+        };
+      case "city":
+        if (!ctx.city?.at && !isPrimary) return undefined;
+        return {
+          candidateId: `turn_city_${ctx.city?.at ?? "unknown"}`,
+          actionId: "city",
+          label: isPrimary ? ctx.headline : `Build a city on ${ctx.city?.name ?? ctx.city?.at ?? "settlement"}`,
+          isLegacyRecommended: isPrimary,
+          legacyScore: ctx.city?.gain,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("city") ?? (isPrimary ? ctx.pct : undefined),
+          at: ctx.city?.at
+        };
+      case "cityTrade":
+        return {
+          candidateId: `turn_cityTrade_${ctx.city?.at ?? "unknown"}`,
+          actionId: "cityTrade",
+          label: isPrimary ? ctx.headline : "Trade, then build a city",
+          isLegacyRecommended: isPrimary,
+          legacyScore: ctx.city?.gain,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("city") ?? (isPrimary ? ctx.pct : undefined),
+          at: ctx.city?.at,
+          requiresTrade: true
+        };
+      case "settle":
+        if (!ctx.touching?.at && !isPrimary) return undefined;
+        return {
+          candidateId: `turn_settle_${ctx.touching?.at ?? "unknown"}`,
+          actionId: "settle",
+          label: isPrimary ? ctx.headline : `Settle ${ctx.touching?.at ?? "spot"}`,
+          isLegacyRecommended: isPrimary,
+          legacyScore: ctx.touching?.value,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("settle") ?? (isPrimary ? ctx.pct : undefined),
+          at: ctx.touching?.at
+        };
+      case "settleTrade":
+        return {
+          candidateId: `turn_settleTrade_${ctx.touching?.at ?? "unknown"}`,
+          actionId: "settleTrade",
+          label: isPrimary ? ctx.headline : "Trade, then settle",
+          isLegacyRecommended: isPrimary,
+          legacyScore: ctx.touching?.value,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          at: ctx.touching?.at,
+          requiresTrade: true
+        };
+      case "road": {
+        const edge = ctx.firstStep?.edge ?? ctx.edgePick?.edge;
+        const toward = ctx.firstStep?.toward ?? ctx.edgePick?.toward ?? ctx.spot?.at;
+        if (!edge && !isPrimary) return undefined;
+        return {
+          candidateId: `turn_road_${edge ?? "unknown"}`,
+          actionId: "road",
+          label: isPrimary ? ctx.headline : `Build road on ${edge ?? "edge"}`,
+          isLegacyRecommended: isPrimary,
+          legacyScore: ctx.edgePick?.score ?? ctx.spot?.value,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("road") ?? (isPrimary ? ctx.pct : undefined),
+          edge,
+          toward,
+          requiresTrade: isPrimary ? ctx.roadTrade : false
+        };
+      }
+      case "trophy": {
+        const edge = ctx.extension?.edge ?? ctx.firstStep?.edge;
+        const toward = ctx.extension?.to ?? ctx.firstStep?.toward;
+        if (!edge && !isPrimary) return undefined;
+        return {
+          candidateId: `turn_trophy_${edge ?? "unknown"}`,
+          actionId: "trophy",
+          label: isPrimary ? ctx.headline : "Build one road and take the longest road",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          edge,
+          toward,
+          requiresTrade: isPrimary ? ctx.roadTrade : false
+        };
+      }
+      case "trophy2":
+        return {
+          candidateId: "turn_trophy2",
+          actionId: "trophy2",
+          label: isPrimary ? ctx.headline : "Start the longest-road fight (two roads)",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          edge: ctx.extension?.edge ?? ctx.firstStep?.edge,
+          requiresTrade: ctx.roadTrade
+        };
+      case "port": {
+        const edge = ctx.portStep?.edge ?? ctx.firstStep?.edge;
+        const toward = ctx.nearPort?.at ?? ctx.firstStep?.toward;
+        if (!edge && !isPrimary) return undefined;
+        return {
+          candidateId: `turn_port_${edge ?? "unknown"}`,
+          actionId: "port",
+          label: isPrimary ? ctx.headline : `Road to port via ${edge ?? "edge"}`,
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          edge,
+          toward,
+          requiresTrade: isPrimary ? ctx.roadTrade : false
+        };
+      }
+      case "buyDev":
+      case "dev":
+        return {
+          candidateId: "turn_buyDev",
+          actionId: "buyDev",
+          label: isPrimary ? ctx.headline : "Buy a development card",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("dev") ?? (isPrimary ? ctx.pct : undefined)
+        };
+      case "army":
+        return {
+          candidateId: "turn_army",
+          actionId: "army",
+          label: isPrimary ? ctx.headline : "Play the knight and take the largest army",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined
+        };
+      case "knight":
+        return {
+          candidateId: "turn_knight",
+          actionId: "knight",
+          label: isPrimary ? ctx.headline : ctx.rolled ? "Play the knight before ending turn" : "Play the knight before rolling",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined
+        };
+      case "roadBuild":
+        return {
+          candidateId: "turn_roadBuild",
+          actionId: "roadBuild",
+          label: isPrimary ? ctx.headline : "Play Road Building",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          edge: ctx.firstStep?.edge,
+          secondEdge: ctx.secondStep?.edge,
+          toward: ctx.firstStep?.toward
+        };
+      case "yop":
+        return {
+          candidateId: isPrimary ? "turn_yop_compound" : "turn_yop",
+          actionId: "yop",
+          label: isPrimary ? ctx.headline : `Play Year of Plenty for ${(ctx.yopCards ?? []).map((r) => LABEL[r]).join(" and ")}`,
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          yopResources: ctx.yopCards ? [...ctx.yopCards] : undefined,
+          compoundWithCity: isPrimary
+        };
+      case "monopoly":
+        return {
+          candidateId: `turn_monopoly_${ctx.mono?.resource ?? "unknown"}`,
+          actionId: "monopoly",
+          label: isPrimary ? ctx.headline : `Play Monopoly on ${ctx.mono ? LABEL[ctx.mono.resource] : "resource"}`,
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: isPrimary ? ctx.pct : undefined,
+          monopolyResource: ctx.mono?.resource
+        };
+      case "hold":
+      default:
+        return {
+          candidateId: "turn_hold",
+          actionId: "hold",
+          label: isPrimary ? ctx.headline : ctx.rolled ? "Hold the cards and end turn" : "Hold the cards and roll",
+          isLegacyRecommended: isPrimary,
+          legacyWinPct: ctx.legacyCandidateWinPcts.get("hold") ?? (isPrimary ? ctx.pct : undefined)
+        };
+    }
+  };
+
+  // 1. Primary legacy recommendation candidate (rank 0)
+  if (ctx.isPreRollDropWarning) {
+    pushCandidate({
+      candidateId: "turn_preRollDropWarning",
+      actionId: "preRollDropWarning",
+      label: ctx.headline,
+      isLegacyRecommended: true,
+      legacyWinPct: ctx.pct
+    });
+  } else if (ctx.isSpendDownOverride) {
+    pushCandidate({
+      candidateId: "turn_spendDown",
+      actionId: "spendDown",
+      label: ctx.headline,
+      isLegacyRecommended: true,
+      legacyWinPct: ctx.pct
+    });
+  } else if (ctx.isMonopolyOverride && ctx.mono) {
+    if (ctx.isMonopolyCompound) {
+      pushCandidate({
+        candidateId: `turn_monopoly_compound_${ctx.mono.resource}_${ctx.action}`,
+        actionId: "monopoly",
+        label: ctx.headline,
+        isLegacyRecommended: true,
+        legacyWinPct: ctx.pct,
+        monopolyResource: ctx.mono.resource,
+        compoundWithAction: ctx.action
+      });
+    } else {
+      pushCandidate({
+        candidateId: `turn_monopoly_${ctx.mono.resource}`,
+        actionId: "monopoly",
+        label: ctx.headline,
+        isLegacyRecommended: true,
+        legacyWinPct: ctx.pct,
+        monopolyResource: ctx.mono.resource
+      });
+    }
+  } else {
+    const primary = makeCandidateForAction(ctx.action, true);
+    if (primary) pushCandidate(primary);
+  }
+
+  // 2. Competing legal candidates for paired evaluation on the same determinized samples
+  if (!ctx.rolled) {
+    const holdPreRoll = makeCandidateForAction("hold", false);
+    if (holdPreRoll) pushCandidate(holdPreRoll);
+    if (ctx.cards.includes("knight") && !seenIds.has("turn_army")) {
+      const knightPreRoll = makeCandidateForAction("knight", false);
+      if (knightPreRoll) pushCandidate(knightPreRoll);
+    }
+  } else {
+    if (ctx.canCity && ctx.city?.at) {
+      const c = makeCandidateForAction("city", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.canPlaceNow && ctx.touching?.at) {
+      const c = makeCandidateForAction("settle", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.known && canPay(ctx.hand, COSTS.dev)) {
+      const c = makeCandidateForAction("buyDev", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.roadsLeft && (!ctx.known || ctx.canPayRoad)) {
+      if (ctx.trophy1 && ctx.extension?.edge) {
+        const c = makeCandidateForAction("trophy", false);
+        if (c) pushCandidate(c);
+      }
+      const cRoad = makeCandidateForAction("road", false);
+      if (cRoad) pushCandidate(cRoad);
+      if (ctx.nearPort && ctx.portStep?.edge) {
+        const cPort = makeCandidateForAction("port", false);
+        if (cPort) pushCandidate(cPort);
+      }
+    }
+    if (ctx.cards.includes("knight") && !seenIds.has("turn_army")) {
+      const c = makeCandidateForAction("knight", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.cards.includes("roadBuilding") && ctx.roadsLeft) {
+      const c = makeCandidateForAction("roadBuild", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.cards.includes("yearOfPlenty") && ctx.yopCards?.length === 2) {
+      const c = makeCandidateForAction("yop", false);
+      if (c) pushCandidate(c);
+    }
+    if (ctx.cards.includes("monopoly") && ctx.mono?.resource) {
+      const c = makeCandidateForAction("monopoly", false);
+      if (c) pushCandidate(c);
+    }
+    const holdMain = makeCandidateForAction("hold", false);
+    if (holdMain) pushCandidate(holdMain);
+  }
+
+  const primaryCand = candidates[0];
+  const legacySummary: LegacyRecommendationSummary = {
+    source: "planTurn",
+    headline: ctx.headline,
+    primaryCandidateId: primaryCand?.candidateId,
+    primaryActionId: primaryCand?.actionId ?? ctx.action,
+    legacyWinPct: ctx.pct,
+    legacyScore: primaryCand?.legacyScore
+  };
+
+  return { legacySummary, candidates };
+}
+

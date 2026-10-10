@@ -3,6 +3,7 @@ import { boardCorners, edgePoints, pointKey, type CornerInfo } from "./geometry"
 import { portAccess, portsNear, portWorth } from "./engine/ports";
 import { pips } from "./replay";
 import { RESOURCES, type Board, type HexTile, type Placements, type PortKind, type Resource, type ResourceHand } from "./types";
+import type { ShadowEvaluationReport } from "./engine/shadow";
 
 // [RECONSTRUCTED TYPE DECLARATIONS]
 export interface BoardContext {
@@ -36,6 +37,7 @@ export interface OpeningPlan {
   picks: OpeningPick[];
   oppWants: Array<{ at: string; reason: string }>;
   note: string;
+  shadowEvaluation?: ShadowEvaluationReport;
 }
 
 export interface MidgameSpot {

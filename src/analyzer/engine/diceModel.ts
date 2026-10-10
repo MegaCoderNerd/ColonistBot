@@ -162,6 +162,7 @@ export interface DiceModelContext {
 
 export interface DiceModelDiagnostics {
   readonly modelId: DiceModelId;
+  readonly fallbackModelId?: DiceModelId;
   readonly mode: "random" | "balanced" | "unknown";
   readonly status: DiceModelStatus;
   readonly isExact: boolean;
@@ -169,6 +170,11 @@ export interface DiceModelDiagnostics {
   readonly alignmentUsed: boolean;
   readonly cycleRollsUsed: number;
   readonly bagRemainingInShoe: number | null;
+  /**
+   * Whether this dice model represents Colonist's documented 1v1 per-player seven-streak /
+   * relative seven-distribution balancing (conditioning next-7 probability on which player rolled prior 7s).
+   */
+  readonly modelsPlayerSevenStreakBalancing: boolean;
   readonly assumptions: readonly string[];
   readonly limitations: readonly string[];
   readonly trainingDataSummary?: string;
@@ -270,6 +276,7 @@ export class StandardFairDiceModel implements DiceModel {
       alignmentUsed: false,
       cycleRollsUsed: 0,
       bagRemainingInShoe: null,
+      modelsPlayerSevenStreakBalancing: false,
       assumptions: ["Two independent, fair six-sided dice (36 equally likely ordered pairs)."],
       limitations: ["Applies only to standard random-dice games (`diceMode === 'random'`), not Colonist Balanced Dice."]
     };
@@ -356,13 +363,15 @@ export class Balanced24Of36ShoeDiceModel implements DiceModel {
           alignmentUsed: true,
           cycleRollsUsed: into,
           bagRemainingInShoe: bagRemaining,
+          modelsPlayerSevenStreakBalancing: false,
           assumptions: [
             "Models Colonist Balanced Dice as a 36-combination shoe that reshuffles every 24 rolls (12 combinations left at reshuffle).",
             `Applies a ${this.repeatMultiplier}x damping multiplier to immediate consecutive sum repeats when roll history is aligned from turn 0.`
           ],
           limitations: [
             "Server-side Colonist Balanced Dice source code is proprietary; this model is an empirical approximation, not an exact specification.",
-            "Requires complete roll history from turn 0 (`alignmentStatus === 'aligned'`) to track the 24-roll shoe phase."
+            "Requires complete roll history from turn 0 (`alignmentStatus === 'aligned'`) to track the 24-roll shoe phase.",
+            "Does not model per-player 1v1 seven-streak or relative seven-distribution balancing (who rolled prior 7s); 7 probability is conditioned only on aggregate roll history."
           ],
           trainingDataSummary:
             "Validated on 51 1v1 Balanced Dice games (35 train [2,424 rolls], 16 holdout [1,144 rolls]): 0/174 24-roll shoe violations, holdout NLL=2.18357 vs 2.29546 for fair 2d6."
@@ -383,6 +392,7 @@ export class Balanced24Of36ShoeDiceModel implements DiceModel {
     const probabilities = normalizeProbabilities(raw);
     const diagnostics: DiceModelDiagnostics = {
       modelId: this.id,
+      fallbackModelId: "balanced_stationary_marginal_approx",
       mode: this.mode,
       status: this.status,
       isExact: false,
@@ -390,11 +400,13 @@ export class Balanced24Of36ShoeDiceModel implements DiceModel {
       alignmentUsed: false,
       cycleRollsUsed: 0,
       bagRemainingInShoe: null,
+      modelsPlayerSevenStreakBalancing: false,
       assumptions: [
         "Roll history is misaligned or outside a 24-roll shoe cycle; uses stationary 1v1 empirical marginal with lag-1/lag-2 repeat damping."
       ],
       limitations: [
-        "Server-side Colonist Balanced Dice algorithm is not publicly specified; mid-game reconnects obscure the 24-roll shoe offset."
+        "Server-side Colonist Balanced Dice algorithm is not publicly specified; mid-game reconnects obscure the 24-roll shoe offset.",
+        "Does not model per-player 1v1 seven-streak or relative seven-distribution balancing (who rolled prior 7s); 7 probability is conditioned only on aggregate roll history."
       ],
       trainingDataSummary:
         "Fitted on 35 training 1v1 Balanced Dice games (2,424 rolls) and evaluated on 16 held-out 1v1 games (1,144 rolls)."
@@ -451,12 +463,14 @@ export class BalancedStationaryMarginalDiceModel implements DiceModel {
       alignmentUsed: false,
       cycleRollsUsed: Math.min(2, history.length),
       bagRemainingInShoe: null,
+      modelsPlayerSevenStreakBalancing: false,
       assumptions: [
         "Uses the Dirichlet-smoothed 1v1 empirical marginal distribution from 35 training recordings with lag-1 (0.68x) and lag-2 (0.78x) repeat damping.",
         "Does not depend on a 24-roll shoe reset boundary."
       ],
       limitations: [
-        "Empirical approximation only (`isExact: false`); does not capture within-cycle card depletion beyond lag-2 repeat suppression."
+        "Empirical approximation only (`isExact: false`); does not capture within-cycle card depletion beyond lag-2 repeat suppression.",
+        "Does not model per-player 1v1 seven-streak or relative seven-distribution balancing (who rolled prior 7s); 7 probability is conditioned only on aggregate roll history."
       ],
       trainingDataSummary:
         "Fitted on 35 training 1v1 Balanced Dice games (2,424 rolls; 7s=15.80%, lag-1 repeat=7.42%) and evaluated on 16 held-out 1v1 games (1,144 rolls)."
@@ -495,6 +509,7 @@ export class UnsupportedDiceModel implements DiceModel {
       alignmentUsed: false,
       cycleRollsUsed: 0,
       bagRemainingInShoe: null,
+      modelsPlayerSevenStreakBalancing: false,
       assumptions: [],
       limitations: [this.reason]
     };

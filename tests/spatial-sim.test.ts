@@ -63,6 +63,22 @@ import {
   runRollout,
   type RolloutPolicy
 } from "../src/analyzer/engine/rollout";
+import {
+  buildOpeningCandidatesFromPlan,
+  buildRobberCandidatesFromTargets,
+  checkShadowEngineSupport,
+  computeWilson95Interval,
+  evaluateCandidatesShadow,
+  evaluateOpeningShadow,
+  evaluateRobberTargetsShadow,
+  mapLegacyCandidateToSimulatedAction,
+  reconstructObservedStateForShadow,
+  type LegacyRecommendationCandidate
+} from "../src/analyzer/engine/shadow";
+import { planTurn } from "../src/analyzer/engine/decide";
+import { coachedOpening } from "../src/analyzer/engine/opening";
+import { robberTargets } from "../src/analyzer/advisor";
+import { createHelper } from "../src/extension/helper";
 import type { Recording } from "../src/shared/schema";
 
 const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08.json";
@@ -2446,6 +2462,1194 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       );
     });
   });
+
+  // ===========================================================================
+  // STAGE 3.4 — Integrate the New Simulation Engine with the Existing Coach
+  // ===========================================================================
+  describe("Stage 3.4 — Coach Shadow-Mode Integration, Paired Candidate Evaluation, and Safety Boundaries", () => {
+    function parseFixtureSlice(recId: string, frameLimit?: number) {
+      const rec = recordings.find((r) => r.id === recId)!;
+      const frames = frameLimit ? rec.frames.slice(0, frameLimit) : rec.frames;
+      const { decoded } = decodeFrames(frames);
+      const parsed = stateDiffAdapter.parse(decoded);
+      const placements = placementsFrom(parsed.events);
+      const me = parsed.selfId ?? parsed.players[0].id;
+      const opp = parsed.players.find((p) => p.id !== me)!.id;
+      return { rec, frames, decoded, parsed, placements, me, opp };
+    }
+
+    it("1. Preserves default coach behavior across planTurn, coachedOpening, robberTargets, and createHelper", () => {
+      for (const recId of ["farm9373", "edge9896", "deck7708"]) {
+        const { parsed, placements, me, rec } = parseFixtureSlice(recId, 850);
+        const board = parsed.board!;
+
+        // 1a. coachedOpening default vs shadow disabled vs shadow enabled
+        const emptyPlacements = placementsFrom([]);
+        const openDefault = coachedOpening(board, emptyPlacements, me, 3, true);
+        const openDisabled = coachedOpening(board, emptyPlacements, me, 3, true, { enabled: false });
+        const openShadow = coachedOpening(board, emptyPlacements, me, 3, true, {
+          enabled: true,
+          baseSeed: "stage-3.4-default-preserve",
+          budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 }
+        });
+
+        expect(openDefault.shadowEvaluation).toBeUndefined();
+        expect(openDisabled.shadowEvaluation).toBeUndefined();
+        expect(openDefault).toEqual(openDisabled);
+        expect(openShadow.shadowEvaluation).toBeDefined();
+        expect(openShadow.shadowEvaluation?.fallbackToLegacyRecommendation).toBe(true);
+        const { shadowEvaluation: _os, ...openShadowRest } = openShadow;
+        expect(openShadowRest).toEqual(openDefault);
+
+        // 1b. planTurn default vs shadow disabled vs shadow enabled
+        const hand = { lumber: 1, brick: 1, wool: 1, grain: 2, ore: 3 };
+        const turnDefault = planTurn({
+          board,
+          placements,
+          me,
+          hand,
+          handKnown: true,
+          snapshot: parsed.snapshot,
+          events: parsed.events
+        });
+        const turnDisabled = planTurn({
+          board,
+          placements,
+          me,
+          hand,
+          handKnown: true,
+          snapshot: parsed.snapshot,
+          events: parsed.events,
+          shadowRollout: { enabled: false }
+        });
+        const turnShadow = planTurn({
+          board,
+          placements,
+          me,
+          hand,
+          handKnown: true,
+          snapshot: parsed.snapshot,
+          events: parsed.events,
+          shadowRollout: {
+            enabled: true,
+            baseSeed: "stage-3.4-turn-preserve",
+            budget: { maxTrialsPerCandidate: 4, maxTurnsPerRollout: 60 }
+          }
+        });
+
+        expect(turnDefault.shadowEvaluation).toBeUndefined();
+        expect(turnDisabled.shadowEvaluation).toBeUndefined();
+        expect(turnDefault).toEqual(turnDisabled);
+        expect(turnShadow.shadowEvaluation).toBeDefined();
+        expect(turnShadow.shadowEvaluation?.fallbackToLegacyRecommendation).toBe(true);
+        const { shadowEvaluation: _ts, ...turnShadowRest } = turnShadow;
+        expect(turnShadowRest).toEqual(turnDefault);
+
+        // 1c. robberTargets unchanged
+        const robTargets = robberTargets(board, placements, me, parsed.snapshot?.robberHex);
+        const robShadow = evaluateRobberTargetsShadow(
+          {
+            board,
+            placements,
+            me,
+            snapshot: parsed.snapshot,
+            events: parsed.events
+          },
+          robTargets,
+          { enabled: true, baseSeed: "stage-3.4-robber-preserve", budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 } }
+        );
+        expect(robShadow.fallbackToLegacyRecommendation).toBe(true);
+        expect(robTargets).toEqual(robberTargets(board, placements, me, parsed.snapshot?.robberHex));
+
+        // 1d. createHelper default vs shadow enabled
+        const helperDefault = createHelper();
+        const helperShadow = createHelper(3, {
+          shadowRollout: {
+            enabled: true,
+            baseSeed: "stage-3.4-helper-preserve",
+            budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 }
+          }
+        });
+        for (const f of rec.frames.slice(0, 850)) {
+          helperDefault.feed(f);
+          helperShadow.feed(f);
+        }
+        const ctx = {
+          meName: rec.meta.me,
+          logNames: parsed.players.map((p) => p.name),
+          rolls: 30,
+          firstPlacedAt: () => undefined,
+          loggedSettlements: () => 2,
+          hook: { sockets: 1, frames: 850 }
+        };
+        const viewDefault = helperDefault.view([], ctx, Date.now() + 5000);
+        const viewShadow = helperShadow.view([], ctx, Date.now() + 5000);
+        expect(viewDefault.shadowEvaluation).toBeUndefined();
+        expect(viewShadow.shadowEvaluation).toBeDefined();
+        const { shadowEvaluation: _vs, ...viewShadowRest } = viewShadow;
+        expect(viewShadowRest).toEqual(viewDefault);
+      }
+    });
+
+    it("2. Reconstructs canonical ObservedGameState from live coach inputs while separating authoritative facts, inferred bounds, and sampled states", () => {
+      const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+
+      // Case A: Exact self hand + opponent log-tracked hand bounds
+      const oppSnap = parsed.snapshot?.players.find((p) => p.id === opp);
+      const oppTotal = oppSnap?.handSize ?? 3;
+      const oppUnknown = Math.max(0, oppTotal - 1);
+      const reconExact = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me,
+        hand: { lumber: 2, brick: 1, wool: 0, grain: 2, ore: 3 },
+        handKnown: true,
+        snapshot: parsed.snapshot,
+        events: parsed.events,
+        oppHand: { lumber: 1, brick: 0, wool: 0, grain: 0, ore: 0 },
+        oppUnknown
+      });
+      expect(reconExact.ok).toBe(true);
+      if (!reconExact.ok) return;
+      expect(reconExact.observed).toBeDefined();
+      expect(reconExact.epistemicLayers.authoritativeFacts.selfHandExact).toBe(true);
+      expect(reconExact.epistemicLayers.sampledLayerPolicy.exposesSampledCardsAsFacts).toBe(false);
+
+      const obsExact = reconExact.observed;
+      const selfPlayer = obsExact.players.find((p) => p.id === me)!;
+      const oppPlayer = obsExact.players.find((p) => p.id === opp)!;
+      expect(selfPlayer.hand.confidence).toBe("exact");
+      expect(selfPlayer.hand.knownMin).toEqual({ lumber: 2, brick: 1, wool: 0, grain: 2, ore: 3 });
+      expect(selfPlayer.hand.unknownCount).toBe(0);
+      if (oppTotal >= 1) {
+        expect(oppPlayer.hand.knownMin.lumber).toBeGreaterThanOrEqual(1);
+      }
+
+      // Case B: Unknown self hand does NOT fabricate an exact hand from input.hand
+      const snapWithoutSelfCards = parsed.snapshot
+        ? {
+            ...parsed.snapshot,
+            players: parsed.snapshot.players.map((p) => (p.id === me ? { ...p, hand: undefined } : p))
+          }
+        : undefined;
+      const reconUnknown = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me,
+        hand: { lumber: 9, brick: 9, wool: 9, grain: 9, ore: 9 },
+        handKnown: false,
+        snapshot: snapWithoutSelfCards,
+        events: parsed.events
+      });
+      expect(reconUnknown.ok).toBe(true);
+      if (!reconUnknown.ok) return;
+      expect(reconUnknown.epistemicLayers.authoritativeFacts.selfHandExact).toBe(false);
+    });
+
+    it("3. Enforces supported vs unsupported state, topology, ruleset, phase, perspective, and dice mode gating", () => {
+      const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+
+      // Supported active self turn
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+      const reconSupported = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me,
+        hand: { lumber: 1, brick: 1, wool: 1, grain: 1, ore: 1 },
+        handKnown: true,
+        snapshot: activeSnap,
+        events: parsed.events
+      });
+      expect(reconSupported.ok).toBe(true);
+      if (!reconSupported.ok) return;
+      const gateOk = checkShadowEngineSupport(reconSupported.observed, me);
+      expect(gateOk.supported).toBe(true);
+
+      // Not self turn -> fails closed with not_self_turn
+      const oppTurnSnap = { ...activeSnap, turnPlayer: opp };
+      const reconOppTurn = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me,
+        snapshot: oppTurnSnap,
+        events: parsed.events
+      });
+      expect(reconOppTurn.ok).toBe(true);
+      if (!reconOppTurn.ok) return;
+      const gateNotSelf = checkShadowEngineSupport(reconOppTurn.observed, me);
+      expect(gateNotSelf.supported).toBe(false);
+      if (!gateNotSelf.supported) expect(gateNotSelf.failureCode).toBe("not_self_turn");
+
+      // Stale state -> fails closed with stale_or_unavailable_state
+      const reconStale = reconstructObservedStateForShadow(
+        {
+          board,
+          placements,
+          me,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { staleStateCheck: { isStale: true } }
+      );
+      expect(reconStale.ok).toBe(false);
+      if (!reconStale.ok) expect(reconStale.errorCode).toBe("stale_or_unavailable_state");
+
+      // Missing board -> fails closed with missing_board
+      const reconNoBoard = reconstructObservedStateForShadow({
+        board: undefined,
+        placements,
+        me
+      });
+      expect(reconNoBoard.ok).toBe(false);
+      if (!reconNoBoard.ok) expect(reconNoBoard.errorCode).toBe("missing_board");
+
+      // Missing self player -> fails closed with missing_self_player
+      const reconNoSelf = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me: "",
+        snapshot: activeSnap,
+        events: parsed.events
+      });
+      expect(reconNoSelf.ok).toBe(false);
+      if (!reconNoSelf.ok) expect(reconNoSelf.errorCode).toBe("missing_self_player");
+      const gateUnseatedSelf = checkShadowEngineSupport(reconSupported.observed, "nonexistent_player");
+      expect(gateUnseatedSelf.supported).toBe(false);
+      if (!gateUnseatedSelf.supported) expect(gateUnseatedSelf.failureCode).toBe("missing_self_player");
+
+      // Unsupported board topology (18 hexes) -> fails closed with unsupported_variant
+      const badBoard = { ...board, hexes: board.hexes.slice(0, 18) };
+      const reconBadTopo = reconstructObservedStateForShadow({
+        board: badBoard,
+        placements,
+        me,
+        snapshot: activeSnap,
+        events: parsed.events
+      });
+      expect(reconBadTopo.ok).toBe(true);
+      if (!reconBadTopo.ok) return;
+      const gateBadTopo = checkShadowEngineSupport(reconBadTopo.observed, me);
+      expect(gateBadTopo.supported).toBe(false);
+      if (!gateBadTopo.supported) expect(gateBadTopo.failureCode).toBe("unsupported_variant");
+
+      // Unsupported ruleset (extensionSetting: 1) -> fails closed with unsupported_ruleset
+      const obsBadRules = {
+        ...cloneObservedGameState(reconSupported.observed),
+        rules: {
+          ...reconSupported.observed.rules,
+          extensionSetting: 1
+        }
+      };
+      const gateBadRules = checkShadowEngineSupport(obsBadRules, me);
+      expect(gateBadRules.supported).toBe(false);
+      if (!gateBadRules.supported) expect(gateBadRules.failureCode).toBe("unsupported_ruleset");
+
+      // Unsupported phase (unknown / setup_waiting / game_over) -> fails closed with unsupported_phase
+      for (const badPhase of ["unknown", "setup_waiting", "game_over"] as const) {
+        const obsBadPhase = {
+          ...cloneObservedGameState(reconSupported.observed),
+          phase: badPhase
+        };
+        const gateBadPhase = checkShadowEngineSupport(obsBadPhase, me);
+        expect(gateBadPhase.supported).toBe(false);
+        if (!gateBadPhase.supported) expect(gateBadPhase.failureCode).toBe("unsupported_phase");
+      }
+
+      // Unknown dice mode without explicit override -> fails closed with unsupported_dice_mode
+      const obsUnknownDice = {
+        ...cloneObservedGameState(reconSupported.observed),
+        rules: {
+          ...reconSupported.observed.rules,
+          diceMode: {
+            mode: "unknown" as const,
+            source: "unknown" as const,
+            confidence: "unknown" as const
+          }
+        }
+      };
+      const gateUnknownDice = checkShadowEngineSupport(obsUnknownDice, me);
+      expect(gateUnknownDice.supported).toBe(false);
+      if (!gateUnknownDice.supported) expect(gateUnknownDice.failureCode).toBe("unsupported_dice_mode");
+
+      // Explicit diceModelId + allowApproximationForUnknownDiceMode allows evaluation when diceMode is unknown
+      const gateOverriddenDice = checkShadowEngineSupport(obsUnknownDice, me, {
+        diceModelId: "standard_fair_2d6",
+        allowApproximationForUnknownDiceMode: true
+      });
+      expect(gateOverriddenDice.supported).toBe(true);
+    });
+
+    it("4. Maps supported coach candidates to exact SimulatedAction objects and explicitly marks compound/unsupported candidates", () => {
+      const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const recon = reconstructObservedStateForShadow({
+        board,
+        placements,
+        me,
+        hand: { lumber: 2, brick: 2, wool: 1, grain: 2, ore: 3 },
+        handKnown: true,
+        snapshot: {
+          ...parsed.snapshot!,
+          turnPlayer: me,
+          turnState: 2,
+          actionState: 0,
+          dice: { d1: 3, d2: 5, thrown: true }
+        },
+        events: parsed.events
+      });
+      expect(recon.ok).toBe(true);
+      if (!recon.ok) return;
+      const obs = recon.observed;
+      const sampleCornerAt = obs.topology.corners[0].at;
+      const sampleEdgeAt = obs.topology.edges[0].at;
+      const sampleHexId = obs.topology.hexes[0].colonistId;
+
+      // Supported single-step candidates
+      const cityMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_city",
+          actionId: "city",
+          label: "City",
+          isLegacyRecommended: true,
+          legacyRank: 0,
+          at: sampleCornerAt
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(cityMap.supported).toBe(true);
+      expect(cityMap.simulatedAction).toEqual({ type: "buildCity", cornerIndex: 0 });
+
+      const settleMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_settle",
+          actionId: "settle",
+          label: "Settle",
+          isLegacyRecommended: false,
+          legacyRank: 1,
+          at: sampleCornerAt
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(settleMap.supported).toBe(true);
+      expect(settleMap.simulatedAction).toEqual({ type: "buildSettlement", cornerIndex: 0 });
+
+      const roadMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_road",
+          actionId: "road",
+          label: "Road",
+          isLegacyRecommended: false,
+          legacyRank: 2,
+          edge: sampleEdgeAt,
+          requiresTrade: false
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(roadMap.supported).toBe(true);
+      expect(roadMap.simulatedAction).toEqual({ type: "buildRoad", edgeIndex: 0 });
+
+      const devMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_dev",
+          actionId: "dev",
+          label: "Buy dev",
+          isLegacyRecommended: false,
+          legacyRank: 3
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(devMap.supported).toBe(true);
+      expect(devMap.simulatedAction).toEqual({ type: "buyDevCard" });
+
+      const knightMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_knight",
+          actionId: "knight",
+          label: "Play knight",
+          isLegacyRecommended: false,
+          legacyRank: 4
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(knightMap.supported).toBe(true);
+      expect(knightMap.simulatedAction).toEqual({ type: "playKnight" });
+
+      const rbMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_rb",
+          actionId: "roadBuild",
+          label: "Play RB",
+          isLegacyRecommended: false,
+          legacyRank: 5
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(rbMap.supported).toBe(true);
+      expect(rbMap.simulatedAction).toEqual({ type: "playRoadBuilding" });
+
+      const yopMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_yop",
+          actionId: "yop",
+          label: "Play YoP",
+          isLegacyRecommended: false,
+          legacyRank: 6,
+          yopResources: ["ore", "grain"],
+          compoundWithCity: false
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(yopMap.supported).toBe(true);
+      expect(yopMap.simulatedAction).toEqual({ type: "playYearOfPlenty", resources: ["ore", "grain"] });
+
+      const monoMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_mono",
+          actionId: "monopoly",
+          label: "Play Monopoly",
+          isLegacyRecommended: false,
+          legacyRank: 7,
+          monopolyResource: "ore"
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(monoMap.supported).toBe(true);
+      expect(monoMap.simulatedAction).toEqual({ type: "playMonopoly", resource: "ore" });
+
+      const passMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "turn_action",
+          candidateId: "c_pass",
+          actionId: "hold",
+          label: "End turn",
+          isLegacyRecommended: false,
+          legacyRank: 8
+        },
+        obs,
+        me,
+        "main"
+      );
+      expect(passMap.supported).toBe(true);
+      expect(passMap.simulatedAction).toEqual({ type: "endTurn" });
+
+      const setupSettleMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "opening_settlement",
+          candidateId: "c_ss",
+          label: "Setup settle",
+          isLegacyRecommended: true,
+          legacyRank: 0,
+          legacyScore: 90,
+          at: sampleCornerAt
+        },
+        obs,
+        me,
+        "setup_settlement"
+      );
+      expect(setupSettleMap.supported).toBe(true);
+      expect(setupSettleMap.simulatedAction).toEqual({ type: "placeSetupSettlement", cornerIndex: 0 });
+
+      const setupRoadMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "setup_road",
+          candidateId: "c_sr",
+          label: "Setup road",
+          isLegacyRecommended: true,
+          legacyRank: 0,
+          legacyScore: 80,
+          edge: sampleEdgeAt
+        },
+        obs,
+        me,
+        "setup_road"
+      );
+      expect(setupRoadMap.supported).toBe(true);
+      expect(setupRoadMap.simulatedAction).toEqual({ type: "placeSetupRoad", edgeIndex: 0 });
+
+      const robberSingleVictimMap = mapLegacyCandidateToSimulatedAction(
+        {
+          kind: "robber_target",
+          candidateId: "c_rob1",
+          label: "Robber 1 victim",
+          isLegacyRecommended: true,
+          legacyRank: 0,
+          legacyScore: 60,
+          hexId: sampleHexId,
+          targets: [opp]
+        },
+        obs,
+        me,
+        "robber_move"
+      );
+      expect(robberSingleVictimMap.supported).toBe(true);
+      expect(robberSingleVictimMap.simulatedAction).toEqual({ type: "moveRobber", hexIndex: 0, victimId: opp });
+
+      // Unsupported / compound / ambiguous candidates fail closed without silently approximating
+      const unsupportedDescriptors: LegacyRecommendationCandidate[] = [
+        { kind: "turn_action", candidateId: "u_burst", actionId: "burst", label: "Burst", isLegacyRecommended: false, legacyRank: 1 },
+        { kind: "turn_action", candidateId: "u_cityTrade", actionId: "cityTrade", label: "City trade", isLegacyRecommended: false, legacyRank: 2, at: sampleCornerAt },
+        { kind: "turn_action", candidateId: "u_settleTrade", actionId: "settleTrade", label: "Settle trade", isLegacyRecommended: false, legacyRank: 3, at: sampleCornerAt },
+        { kind: "turn_action", candidateId: "u_trophy2", actionId: "trophy2", label: "Trophy 2", isLegacyRecommended: false, legacyRank: 4 },
+        { kind: "turn_action", candidateId: "u_drop", actionId: "preRollDropWarning", label: "Pre-roll drop", isLegacyRecommended: false, legacyRank: 5 },
+        { kind: "turn_action", candidateId: "u_spend", actionId: "spendDown", label: "Spend down", isLegacyRecommended: false, legacyRank: 6 },
+        { kind: "turn_action", candidateId: "u_road_trade", actionId: "road", label: "Road w/ trade", isLegacyRecommended: false, legacyRank: 7, edge: sampleEdgeAt, requiresTrade: true },
+        { kind: "turn_action", candidateId: "u_yop_city", actionId: "yop", label: "YoP + City", isLegacyRecommended: false, legacyRank: 8, yopResources: ["ore", "grain"], compoundWithCity: true },
+        { kind: "turn_action", candidateId: "u_yop_1", actionId: "yop", label: "YoP 1 card", isLegacyRecommended: false, legacyRank: 9, yopResources: ["ore"] },
+        { kind: "turn_action", candidateId: "u_mono_comp", actionId: "monopoly", label: "Mono + Build", isLegacyRecommended: false, legacyRank: 10, monopolyResource: "ore", compoundWithAction: "city" }
+      ];
+      for (const desc of unsupportedDescriptors) {
+        const mapped = mapLegacyCandidateToSimulatedAction(desc, obs, me, "main");
+        expect(mapped.supported, `Expected ${desc.candidateId} to be unsupported`).toBe(false);
+        expect(mapped.simulatedAction).toBeUndefined();
+        expect(mapped.unsupportedReason).toBeDefined();
+      }
+
+      // RobberTarget with multiple potential victims fails closed
+      const multiVictimRobberCands = buildRobberCandidatesFromTargets([
+        {
+          hexId: sampleHexId,
+          number: 8,
+          resource: "ore",
+          targets: ["opp1", "opp2"],
+          blocksOpponent: 2,
+          blocksSelf: 0,
+          score: 42,
+          note: "blocks 8 ore"
+        }
+      ]);
+      expect(multiVictimRobberCands.length).toBe(1);
+      const multiRobMap = mapLegacyCandidateToSimulatedAction(multiVictimRobberCands[0], obs, me, "robber_move");
+      expect(multiRobMap.supported).toBe(false);
+      if (!multiRobMap.supported) {
+        expect(multiRobMap.unsupportedCode).toBe("ambiguous_robber_victim");
+      }
+    });
+
+    it("5. Rejects illegal candidate actions via isActionLegal and applyAction on the cloned determinized state", () => {
+      const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+
+      // Candidate 1: buildCity on an empty corner (illegal)
+      // Candidate 2: buildSettlement with 0 resources (illegal)
+      // Candidate 3: endTurn (legal)
+      const emptyCornerAt = getBoardTopology(board).corners.find(
+        (c) => !placements.settlements.has(c.at) && !placements.cities.has(c.at)
+      )!.at;
+
+      const report = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Illegal test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "illegal_city",
+            actionId: "city",
+            label: "Illegal City on empty corner",
+            isLegacyRecommended: true,
+            legacyRank: 0,
+            at: emptyCornerAt
+          },
+          {
+            kind: "turn_action",
+            candidateId: "illegal_settle",
+            actionId: "settle",
+            label: "Illegal Settle with empty hand",
+            isLegacyRecommended: false,
+            legacyRank: 1,
+            at: emptyCornerAt
+          },
+          {
+            kind: "turn_action",
+            candidateId: "legal_pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: false,
+            legacyRank: 2
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-legality-rejection",
+          budget: { maxTrialsPerCandidate: 4, maxTurnsPerRollout: 60 }
+        }
+      );
+
+      const cityCand = report.candidateEvaluations.find((c) => c.candidate.candidateId === "illegal_city")!;
+      const settleCand = report.candidateEvaluations.find((c) => c.candidate.candidateId === "illegal_settle")!;
+      const passCand = report.candidateEvaluations.find((c) => c.candidate.candidateId === "legal_pass")!;
+
+      expect(cityCand.evaluationStatus).toBe("rejected_illegal_candidate");
+      expect(cityCand.isSufficientlySupported).toBe(false);
+      expect(cityCand.failures.illegalAction).toBe(4);
+      expect(cityCand.completedGames).toBe(0);
+
+      expect(settleCand.evaluationStatus).toBe("rejected_illegal_candidate");
+      expect(settleCand.isSufficientlySupported).toBe(false);
+      expect(settleCand.failures.illegalAction).toBe(4);
+      expect(settleCand.completedGames).toBe(0);
+
+      expect(passCand.failures.illegalAction).toBe(0);
+      expect(passCand.completedGames).toBeGreaterThan(0);
+    });
+
+    it("6 & 7. Evaluates candidates on paired determinized samples with order-independent seeds and deterministic repeatability", () => {
+      const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+      const mySettlementAt = [...placements.settlements.entries()].find(([, owner]) => owner === me)![0];
+
+      const candCity: LegacyRecommendationCandidate = {
+        kind: "turn_action",
+        candidateId: "cand_city",
+        actionId: "city",
+        label: "Upgrade city",
+        isLegacyRecommended: true,
+        legacyRank: 0,
+        legacyScore: 100,
+        at: mySettlementAt
+      };
+      const candDev: LegacyRecommendationCandidate = {
+        kind: "turn_action",
+        candidateId: "cand_dev",
+        actionId: "dev",
+        label: "Buy development card",
+        isLegacyRecommended: false,
+        legacyRank: 1,
+        legacyScore: 55
+      };
+      const candPass: LegacyRecommendationCandidate = {
+        kind: "turn_action",
+        candidateId: "cand_pass",
+        actionId: "hold",
+        label: "Hold / End turn",
+        isLegacyRecommended: false,
+        legacyRank: 2,
+        legacyScore: 0
+      };
+
+      const input = {
+        board,
+        placements,
+        me,
+        hand: { lumber: 0, brick: 0, wool: 1, grain: 2, ore: 3 },
+        handKnown: true,
+        snapshot: activeSnap,
+        events: parsed.events
+      };
+      const summary = { source: "planTurn" as const, headline: "Upgrade city", primaryCandidateId: "cand_city" };
+      const config = {
+        enabled: true,
+        baseSeed: "stage-3.4-paired-order-test",
+        budget: {
+          maxTrialsPerCandidate: 10,
+          maxTurnsPerRollout: 80,
+          minCompletedTrialsForSupport: 5,
+          maxElapsedMs: 5000
+        }
+      };
+
+      // Run 1: [candCity, candDev, candPass]
+      const rep1 = evaluateCandidatesShadow(input, summary, [candCity, candDev, candPass], config);
+      // Run 2: exact repeat
+      const rep2 = evaluateCandidatesShadow(input, summary, [candCity, candDev, candPass], config);
+      // Run 3: permuted candidate order [candPass, candCity, candDev]
+      const repPermuted = evaluateCandidatesShadow(input, summary, [candPass, candCity, candDev], config);
+
+      // Deterministic repeatability (excluding wall-clock elapsedMs)
+      expect(rep1.experimentalTopCandidateId).toBe(rep2.experimentalTopCandidateId);
+      expect(rep1.experimentalAgreesWithLegacy).toBe(rep2.experimentalAgreesWithLegacy);
+      expect(rep1.candidateEvaluations.map((c) => ({ ...c, elapsedMs: 0 }))).toEqual(
+        rep2.candidateEvaluations.map((c) => ({ ...c, elapsedMs: 0 }))
+      );
+
+      // Order independence: every candidate's rollout outcomes are 100% identical regardless of candidate ordering!
+      for (const id of ["cand_city", "cand_dev", "cand_pass"]) {
+        const c1 = rep1.candidateEvaluations.find((c) => c.candidate.candidateId === id)!;
+        const cPerm = repPermuted.candidateEvaluations.find((c) => c.candidate.candidateId === id)!;
+        expect(cPerm.completedGames).toBe(c1.completedGames);
+        expect(cPerm.wins).toBe(c1.wins);
+        expect(cPerm.losses).toBe(c1.losses);
+        expect(cPerm.draws).toBe(c1.draws);
+        expect(cPerm.cutoffs).toEqual(c1.cutoffs);
+        expect(cPerm.empiricalWinRateAmongCompleted).toBe(c1.empiricalWinRateAmongCompleted);
+        expect(cPerm.wilson95Interval).toEqual(c1.wilson95Interval);
+        expect(cPerm.medianTurnsAmongCompleted).toBe(c1.medianTurnsAmongCompleted);
+        expect(cPerm.medianActionsAmongCompleted).toBe(c1.medianActionsAmongCompleted);
+      }
+
+      // Paired comparison against legacy top candidate ("cand_city") is populated
+      const devEval = rep1.candidateEvaluations.find((c) => c.candidate.candidateId === "cand_dev")!;
+      expect(devEval.comparisonVsLegacyTop).toBeDefined();
+      const pc = devEval.comparisonVsLegacyTop!;
+      expect(pc.pairedCompletedTrials).toBe(
+        pc.bothWon + pc.bothLost + pc.bothDrew + pc.candidateWonBaselineLost + pc.baselineWonCandidateLost
+      );
+    });
+
+    it("8. Separates completed games from cutoffs and failures and computes honest Wilson intervals", () => {
+      const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+
+      // Force maxTurnsPerRollout = 1 so every trial hits a cutoff
+      const cutoffReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Cutoff test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-cutoff-accounting",
+          budget: {
+            maxTrialsPerCandidate: 6,
+            maxTurnsPerRollout: 1,
+            minCompletedTrialsForSupport: 1
+          }
+        }
+      );
+
+      expect(cutoffReport.status).toBe("inconclusive");
+      const cand = cutoffReport.candidateEvaluations[0];
+      expect(cand.determinizationAttempts).toBe(6);
+      expect(cand.completedGames).toBe(0);
+      expect(cand.wins).toBe(0);
+      expect(cand.losses).toBe(0);
+      expect(cand.draws).toBe(0);
+      expect(cand.cutoffs.total).toBe(6);
+      expect(cand.cutoffs.maxTurns).toBe(6);
+      expect(cand.empiricalWinRateAmongCompleted).toBeNull();
+      expect(cand.wilson95Interval).toBeNull();
+      expect(cand.isSufficientlySupported).toBe(false);
+
+      // Verify Wilson 95% interval bounds on known inputs
+      expect(computeWilson95Interval(0, 0)).toBeNull();
+      const wHalf = computeWilson95Interval(50, 100)!;
+      expect(wHalf.lower).toBeGreaterThan(0.39);
+      expect(wHalf.upper).toBeLessThan(0.61);
+      const wAll = computeWilson95Interval(20, 20)!;
+      expect(wAll.lower).toBeGreaterThan(0.8);
+      expect(wAll.upper).toBe(1);
+    });
+
+    it("9 & 10. Enforces runtime budgets (candidates, trials, total rollouts, elapsed ms, simulated actions) and stale-work cancellation", () => {
+      const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+
+      // 9a. Stale-work callback cancels mid-evaluation and marks stoppedByStaleCallback
+      let checkCount = 0;
+      const staleMidReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Stale callback test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "dev",
+            actionId: "dev",
+            label: "Buy dev",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          },
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: false,
+            legacyRank: 1
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-stale-callback",
+          budget: {
+            maxTrialsPerCandidate: 10,
+            isStaleCallback: () => {
+              checkCount++;
+              return checkCount >= 3;
+            }
+          }
+        }
+      );
+      expect(staleMidReport.budgetDiagnostics.stoppedByStaleCallback).toBe(true);
+      expect(staleMidReport.fallbackToLegacyRecommendation).toBe(true);
+
+      // 9b. Helper stale state (logged settlements > network settlements for > STALE_AFTER_MS) falls back cleanly
+      const helperStale = createHelper(3, {
+        shadowRollout: { enabled: true, baseSeed: "stage-3.4-helper-stale" }
+      });
+      const rec = recordings.find((r) => r.id === "farm9373")!;
+      for (const f of rec.frames.slice(0, 850)) helperStale.feed(f);
+      const t0 = Date.now() + 5000;
+      helperStale.view(
+        [],
+        {
+          meName: rec.meta.me,
+          logNames: parsed.players.map((p) => p.name),
+          rolls: 30,
+          firstPlacedAt: () => undefined,
+          loggedSettlements: () => 99, // triggers behindSince
+          hook: { sockets: 1, frames: 850 }
+        },
+        t0
+      );
+      const staleView = helperStale.view(
+        [],
+        {
+          meName: rec.meta.me,
+          logNames: parsed.players.map((p) => p.name),
+          rolls: 30,
+          firstPlacedAt: () => undefined,
+          loggedSettlements: () => 99,
+          hook: { sockets: 1, frames: 850 }
+        },
+        t0 + 4000
+      );
+      expect(staleView.lines[0]).toContain("The board data is behind the game");
+      expect(staleView.shadowEvaluation?.status).toBe("stale_or_unavailable_state");
+      expect(staleView.shadowEvaluation?.fallbackToLegacyRecommendation).toBe(true);
+
+      // 10a. Budget enforcement: maxCandidates = 1 and maxTotalRollouts = 3
+      const budgetReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Budget cap test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "dev",
+            actionId: "dev",
+            label: "Buy dev",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          },
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: false,
+            legacyRank: 1
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-budget-test",
+          budget: {
+            maxCandidates: 1,
+            maxTrialsPerCandidate: 10,
+            maxTotalRollouts: 3,
+            maxTurnsPerRollout: 60
+          }
+        }
+      );
+      expect(budgetReport.budgetDiagnostics.totalRolloutsExecuted).toBeLessThanOrEqual(3);
+      expect(budgetReport.budgetDiagnostics.stoppedByRolloutCap).toBe(true);
+      expect(budgetReport.budgetDiagnostics.candidatesSkippedByCap).toBe(1);
+      expect(budgetReport.candidateEvaluations[1].evaluationStatus).toBe("skipped_budget_candidate_cap");
+
+      // 10b. Budget enforcement: maxTotalSimulatedActions = 25
+      const actionBudgetReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Action cap test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-action-budget",
+          budget: {
+            maxTrialsPerCandidate: 10,
+            maxTotalSimulatedActions: 25
+          }
+        }
+      );
+      expect(actionBudgetReport.budgetDiagnostics.stoppedByActionCap).toBe(true);
+    });
+
+    it("11 & 12. Evaluates dice-model selection/fallback and compares legacy ranking vs shadow rollout evaluation on representative positions", () => {
+      const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
+      const board = parsed.board!;
+      const activeSnap = {
+        ...parsed.snapshot!,
+        turnPlayer: me,
+        turnState: 2,
+        actionState: 0,
+        dice: { d1: 3, d2: 5, sum: 8, thrown: true }
+      };
+
+      // 12a. Aligned Balanced Dice -> uses balanced_24_of_36_shoe_approx with modelsPlayerSevenStreakBalancing: false
+      const alignedEvents = parsed.events.filter((e) => e.type !== "roll");
+      const alignedReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: { ...activeSnap, completedTurns: 0 },
+          events: alignedEvents
+        },
+        { source: "planTurn", headline: "Aligned dice test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-dice-aligned",
+          budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 }
+        }
+      );
+      expect(alignedReport.diceDiagnostics?.effectiveModelId).toBe("balanced_24_of_36_shoe_approx");
+      expect(alignedReport.diceDiagnostics?.isExact).toBe(false);
+      expect(alignedReport.diceDiagnostics?.status).toBe("empirical_approximation");
+      expect(alignedReport.diceDiagnostics?.modelsPlayerSevenStreakBalancing).toBe(false);
+
+      // 12b. Misaligned Balanced Dice -> automatically falls back to balanced_stationary_marginal_approx
+      const misalignedReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: { ...activeSnap, completedTurns: 99 }, // intentionally misaligned with roll events
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Misaligned dice test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-dice-misaligned",
+          budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 }
+        }
+      );
+      expect(misalignedReport.diceDiagnostics?.alignmentStatus).toBe("misaligned_midgame");
+      expect(misalignedReport.diceDiagnostics?.effectiveModelId).toBe("balanced_stationary_marginal_approx");
+      expect(misalignedReport.diceDiagnostics?.fallbackModelId).toBe("balanced_stationary_marginal_approx");
+      expect(misalignedReport.diceDiagnostics?.isExact).toBe(false);
+      expect(misalignedReport.diceDiagnostics?.modelsPlayerSevenStreakBalancing).toBe(false);
+
+      // 12c. Standard Fair 2d6 override -> exact = true
+      const fairReport = evaluateCandidatesShadow(
+        {
+          board,
+          placements,
+          me,
+          hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 },
+          handKnown: true,
+          snapshot: activeSnap,
+          events: parsed.events
+        },
+        { source: "planTurn", headline: "Fair dice test" },
+        [
+          {
+            kind: "turn_action",
+            candidateId: "pass",
+            actionId: "hold",
+            label: "End turn",
+            isLegacyRecommended: true,
+            legacyRank: 0
+          }
+        ],
+        {
+          enabled: true,
+          baseSeed: "stage-3.4-dice-fair",
+          diceModelId: "standard_fair_2d6",
+          budget: { maxTrialsPerCandidate: 3, maxTurnsPerRollout: 60 }
+        }
+      );
+      expect(fairReport.diceDiagnostics?.effectiveModelId).toBe("standard_fair_2d6");
+      expect(fairReport.diceDiagnostics?.isExact).toBe(true);
+      expect(fairReport.diceDiagnostics?.status).toBe("exact_validated");
+
+      // 11. Side-by-side comparison across representative positions in farm9373, edge9896, and deck7708
+      const benchmarkRows: string[] = [];
+      for (const recId of ["farm9373", "edge9896", "deck7708"]) {
+        const { parsed: p, placements: pl, me: selfId } = parseFixtureSlice(recId, 800);
+        const b = p.board!;
+        const snap = {
+          ...p.snapshot!,
+          turnPlayer: selfId,
+          turnState: 2,
+          actionState: 0,
+          dice: { d1: 4, d2: 4, sum: 8, thrown: true }
+        };
+        const turnRes = planTurn({
+          board: b,
+          placements: pl,
+          me: selfId,
+          hand: { lumber: 1, brick: 1, wool: 1, grain: 2, ore: 3 },
+          handKnown: true,
+          snapshot: snap,
+          events: p.events,
+          shadowRollout: {
+            enabled: true,
+            baseSeed: `stage-3.4-bench-${recId}`,
+            budget: {
+              maxCandidates: 4,
+              maxTrialsPerCandidate: 12,
+              maxTotalRollouts: 48,
+              maxElapsedMs: 2000,
+              maxTurnsPerRollout: 120,
+              minCompletedTrialsForSupport: 6
+            }
+          }
+        });
+
+        const se = turnRes.shadowEvaluation!;
+        expect(se).toBeDefined();
+        expect(se.status).toBe("evaluated");
+        expect(se.fallbackToLegacyRecommendation).toBe(true);
+        expect(se.candidateEvaluations.length).toBeGreaterThanOrEqual(2);
+
+        const topShadow = se.candidateEvaluations.find(
+          (c) => c.candidate.candidateId === se.experimentalTopCandidateId
+        );
+        benchmarkRows.push(
+          `${recId}: status=${se.status} | legacyTop=${se.legacyRecommendation.primaryCandidateId} | shadowTop=${se.experimentalTopCandidateId} ` +
+            `(winRate=${topShadow?.empiricalWinRateAmongCompleted !== null && topShadow?.empiricalWinRateAmongCompleted !== undefined ? (topShadow.empiricalWinRateAmongCompleted * 100).toFixed(1) + "%" : "n/a"}, ` +
+            `CI=[${topShadow?.wilson95Interval ? `${(topShadow.wilson95Interval.lower * 100).toFixed(1)}%, ${(topShadow.wilson95Interval.upper * 100).toFixed(1)}%` : "n/a"}]) | ` +
+            `agrees=${se.experimentalAgreesWithLegacy} (${topShadow?.comparisonVsLegacyTop?.classification ?? "n/a"}) | ` +
+            `rollouts=${se.budgetDiagnostics.totalRolloutsExecuted} | ` +
+            `timing(total=${se.timing.totalElapsedMs.toFixed(1)}ms, recon=${se.timing.stateReconstructionMs.toFixed(2)}ms, ` +
+            `map=${se.timing.candidateMappingMs.toFixed(2)}ms, det=${se.timing.determinizationMs.toFixed(2)}ms, ` +
+            `roll=${se.timing.rolloutExecutionMs.toFixed(1)}ms, agg=${se.timing.aggregationMs.toFixed(2)}ms)`
+        );
+      }
+
+      console.log("[Stage 3.4 Shadow Evaluation Benchmarks]\n  " + benchmarkRows.join("\n  "));
+    });
+  });
 });
+
+
 
 
