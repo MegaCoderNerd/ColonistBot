@@ -40,7 +40,7 @@ export interface TurnPlan {
 const LABEL: Record<Resource, string> = { lumber: "wood", brick: "brick", wool: "sheep", grain: "wheat", ore: "ore" };
 
 export function planTurn(input: TurnPlanInput): TurnPlan {
-  const goal = input.goal ?? 15;
+  const goal = input.goal ?? input.snapshot?.gameSettings?.victoryPointsToWin ?? 15;
   const ctx = contextFor(input.board);
   const own = profileOf(ctx, input.placements, (o) => o === input.me);
   const his = profileOf(ctx, input.placements, (o) => o !== input.me);
@@ -48,11 +48,11 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const oppSnap = input.snapshot?.players.find((p) => p.id !== input.me);
   const oppId = oppSnap?.id ?? [...input.placements.settlements, ...input.placements.cities, ...input.placements.roads].map(([, owner]) => owner).find((owner) => owner !== input.me);
   const myVp = vpOf(meSnap, input.placements, input.me);
-  const hisVp = vpOf(oppSnap, input.placements, oppId);
+  const hisVp = visibleVpOf(oppSnap, input.placements, oppId);
   const ratios = ratiosOf(meSnap);
   const hand = input.hand ?? { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 };
   const known = input.handKnown !== false && input.hand !== undefined;
-  const cards = meSnap?.devCards ?? [];
+  const cards = playableCardsOf(meSnap);
   const rolled = input.snapshot?.dice?.thrown === true;
   const roadsLeft = meSnap?.roadsLeft !== 0;
   const settlesLeft = meSnap?.settlementsLeft !== 0;
@@ -63,7 +63,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const knightCount: Record<string, number> = {};
   for (const p of input.snapshot?.players ?? []) {
     handSizes[p.id] = p.handSize;
-    devsInHand[p.id] = p.devsInHand;
+    devsInHand[p.id] = p.unknownDevsInHand ?? p.devsInHand;
     knightCount[p.id] = p.knights;
   }
   const ranked = rankLiveSpots(input.board, input.placements, input.me, input.events ?? [], {
@@ -179,7 +179,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const seenRolls = seen.map((e) => e.total);
   const seenFaces = seen.map((e) => ({ total: e.total, d1: e.d1, d2: e.d2, player: e.player }));
   const alignedBag = bagAligned(input.snapshot?.completedTurns, seenRolls.length);
-  const discardLimit = meSnap?.discardLimit ?? 9;
+  const discardLimit = meSnap?.discardLimit ?? input.snapshot?.gameSettings?.cardDiscardLimit ?? 9;
   if (action === "yop" && !rolled && known && total(hand) + 2 > discardLimit) action = canCity ? "city" : cityClose ? "cityTrade" : "hold";
   const edgePick = bestEdge(input.board, input.placements, input.me, { rolls: seenRolls, aligned: alignedBag, hand, maxDist: 2 });
   const locked = action === "army" || action === "knight" || action === "yop" || action === "roadBuild" || action === "burst" || action === "trophy" || action === "trophy2" || action === "port";
@@ -524,7 +524,7 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   return {
     headline,
     why,
-    race: `About ${pct}% from here. ${nextRoll} You have ${myVp} VP, he has ${hisVp}. First to ${goal}. Buildings alone stop at 13, so the last points are the army, the road, or a dev card.${phase}${raceLead}${(oppSnap?.devsInHand ?? 0) > 0 ? " He holds a dev card, and one in five is a hidden point." : ""}`,
+    race: `About ${pct}% from here. ${nextRoll} You have ${myVp} VP, he has ${hisVp}. First to ${goal}. Buildings alone stop at 13, so the last points are the army, the road, or a dev card.${phase}${raceLead}${(oppSnap?.unknownDevsInHand ?? oppSnap?.devsInHand ?? 0) > 0 ? " He holds a dev card, and one in five is a hidden point." : ""}`,
     tips,
     settle: shown
       ? {
@@ -545,6 +545,28 @@ function vpOf(snap: PlayerSnapshot | undefined, placements: Placements, id?: str
   const built = id ? publicVp(placements, id) : 0;
   if (snap && snap.vp > 0) return Math.max(snap.vp, built);
   return built;
+}
+
+function visibleVpOf(snap: PlayerSnapshot | undefined, placements: Placements, id?: string): number {
+  const built = id ? publicVp(placements, id) : 0;
+  const visible = snap ? (snap.visibleVp ?? snap.vp) : 0;
+  if (visible > 0) return Math.max(visible, built);
+  return built;
+}
+
+export function playableCardsOf(snap?: PlayerSnapshot): DevCardKind[] {
+  if (!snap) return [];
+  if (snap.playableDevCards) {
+    return snap.hasUsedDevThisTurn ? snap.playableDevCards.filter((c) => c === "victoryPoint") : snap.playableDevCards;
+  }
+  const base = [...(snap.devCards ?? [])];
+  if (snap.hasUsedDevThisTurn) return base.filter((c) => c === "victoryPoint");
+  for (const bought of snap.devsBoughtThisTurn ?? []) {
+    if (bought === "victoryPoint") continue;
+    const idx = base.indexOf(bought);
+    if (idx >= 0) base.splice(idx, 1);
+  }
+  return base;
 }
 
 function ratiosOf(snap?: PlayerSnapshot): ResourceHand {

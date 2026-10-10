@@ -13,6 +13,8 @@ export const RESOURCE_BY_ID: Record<number, Resource> = {
 export interface PlayerSnapshot {
   id: string;
   vp: number;
+  visibleVp: number;
+  hiddenVp: number;
   handSize: number;
   ratios: ResourceBag;
   roadLength: number;
@@ -20,13 +22,32 @@ export interface PlayerSnapshot {
   army: number;
   hasLargestArmy: boolean;
   devsInHand: number;
+  unknownDevsInHand: number;
   devsPlayed: number;
   knights: number;
   devCards?: DevCardKind[];
+  playableDevCards?: DevCardKind[];
+  devsBoughtThisTurn?: DevCardKind[];
+  hasUsedDevThisTurn?: boolean;
   settlementsLeft?: number;
   citiesLeft?: number;
   roadsLeft?: number;
   discardLimit?: number;
+}
+
+export interface GameSettingsSnapshot {
+  id?: string;
+  gameType?: number;
+  modeSetting?: number;
+  extensionSetting?: number;
+  scenarioSetting?: number;
+  mapSetting?: number;
+  diceSetting?: number;
+  victoryPointsToWin?: number;
+  cardDiscardLimit?: number;
+  maxPlayers?: number;
+  hideBankCards?: boolean;
+  friendlyRobber?: boolean;
 }
 
 export interface GameSnapshot {
@@ -38,4 +59,6 @@ export interface GameSnapshot {
   actionState?: number;
   completedTurns?: number;
   robberHex?: string;
+  gameSettings?: GameSettingsSnapshot;
 }
+

@@ -1,7 +1,7 @@
 // Recovered from content.js (lines 4969-5359)
 import type { DecodedFrame } from "../decode";
 import { portKind } from "../geometry";
-import { RESOURCE_BY_ID, type GameSnapshot, type PlayerSnapshot } from "../snapshot";
+import { RESOURCE_BY_ID, type GameSettingsSnapshot, type GameSnapshot, type PlayerSnapshot } from "../snapshot";
 import type { Board, DevCardKind, GameEvent, GameEventDraft, HexTile, PlayerInfo, Resource, ResourceBag } from "../types";
 import { isObject, num, type AdapterParseResult, type FrameAdapter } from "./types";
 
@@ -14,6 +14,7 @@ const HEX_RESOURCE: Record<number, Resource | null> = {
   5: "ore"
 };
 
+export const FACE_DOWN_DEV_CARD_ID = 10;
 
 export const DEV_CARD: Record<number, DevCardKind> = {
   11: "knight",
@@ -23,6 +24,21 @@ export const DEV_CARD: Record<number, DevCardKind> = {
   15: "yearOfPlenty"
 };
 
+/**
+ * Verified Colonist victoryPointsState category mapping:
+ * - "0": Settlements (1 VP each, visible)
+ * - "1": Cities (2 VP each, visible)
+ * - "2": Victory Point development cards (1 VP each, hidden from opponents during live play)
+ * - "3": Largest Army award (2 VP, visible)
+ * - "4": Longest Road award (2 VP, visible)
+ */
+export const VP_CATEGORY_WEIGHT: Record<string, { weight: number; hidden?: boolean }> = {
+  "0": { weight: 1 },
+  "1": { weight: 2 },
+  "2": { weight: 1, hidden: true },
+  "3": { weight: 2 },
+  "4": { weight: 2 }
+};
 
 export function cloneWithoutNulls(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(cloneWithoutNulls);
@@ -48,7 +64,7 @@ export function deepMerge(target: Record<string, unknown>, patch: Record<string,
   }
 }
 
-const STATE_KEYS = ["mapState", "playerStates", "diceState", "currentState", "mechanicRobberState"];
+const STATE_KEYS = ["mapState", "playerStates", "diceState", "currentState", "mechanicRobberState", "gameSettings"];
 
 export function findStatePatch(value: unknown, depth = 0): Record<string, unknown> | undefined {
   if (depth > 6) return undefined;
@@ -61,8 +77,12 @@ export function findStatePatch(value: unknown, depth = 0): Record<string, unknow
   }
   if (!isObject(value)) return undefined;
   if (isObject(value.diff)) return value.diff;
-  if (isObject(value.gameState)) return value.gameState;
-  if (isObject(value.initialState)) return value.initialState;
+  if (isObject(value.gameState)) {
+    return isObject(value.gameSettings) ? { ...value.gameState, gameSettings: value.gameSettings } : value.gameState;
+  }
+  if (isObject(value.initialState)) {
+    return isObject(value.gameSettings) ? { ...value.initialState, gameSettings: value.gameSettings } : value.initialState;
+  }
   if (STATE_KEYS.some((k) => isObject(value[k]))) return value;
   for (const v of Object.values(value)) {
     if (isObject(v) || Array.isArray(v)) {
@@ -89,14 +109,28 @@ function userStatesOf(value: unknown): unknown[] | undefined {
   return undefined;
 }
 
-export function sumVp(v: unknown): number | undefined {
-  if (typeof v === "number") return v;
+export function breakdownVp(v: unknown): { visibleVp: number; hiddenVp: number; totalVp: number } | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return { visibleVp: v, hiddenVp: 0, totalVp: v };
+  }
   if (isObject(v)) {
-    let total = 0;
-    for (const x of Object.values(v)) if (typeof x === "number") total += x;
-    return total;
+    let visibleVp = 0;
+    let hiddenVp = 0;
+    for (const [k, raw] of Object.entries(v)) {
+      const count = num(raw);
+      if (count === undefined) continue;
+      const cat = VP_CATEGORY_WEIGHT[k];
+      const pts = count * (cat?.weight ?? 1);
+      if (cat?.hidden) hiddenVp += pts;
+      else visibleVp += pts;
+    }
+    return { visibleVp, hiddenVp, totalVp: visibleVp + hiddenVp };
   }
   return undefined;
+}
+
+export function sumVp(v: unknown): number | undefined {
+  return breakdownVp(v)?.totalVp;
 }
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
@@ -278,7 +312,7 @@ export const stateDiffAdapter: FrameAdapter = {
             handByPlayer.set(id, cards.length);
             push({ type: "hand", player: id, size: cards.length });
           }
-          const vp = sumVp(raw.victoryPoints);
+          const vp = sumVp(raw.victoryPointsState) ?? sumVp(raw.victoryPoints);
           if (vp !== undefined && vpByPlayer.get(id) !== vp) {
             vpByPlayer.set(id, vp);
             push({ type: "vp", player: id, vp });
@@ -320,7 +354,29 @@ export const stateDiffAdapter: FrameAdapter = {
   }
 };
 
+export function readGameSettings(raw: unknown): GameSettingsSnapshot | undefined {
+  if (!isObject(raw)) return undefined;
+  const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+  const out: GameSettingsSnapshot = {
+    id: str(raw.id),
+    gameType: num(raw.gameType),
+    modeSetting: num(raw.modeSetting),
+    extensionSetting: num(raw.extensionSetting),
+    scenarioSetting: num(raw.scenarioSetting),
+    mapSetting: num(raw.mapSetting),
+    diceSetting: num(raw.diceSetting),
+    victoryPointsToWin: num(raw.victoryPointsToWin),
+    cardDiscardLimit: num(raw.cardDiscardLimit),
+    maxPlayers: num(raw.maxPlayers),
+    hideBankCards: bool(raw.hideBankCards),
+    friendlyRobber: bool(raw.friendlyRobber)
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
+
 export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string): GameSnapshot {
+  const gameSettings = readGameSettings(get(state, "gameSettings"));
   const players: PlayerSnapshot[] = [];
   for (const [key, raw] of Object.entries(asRecord(get(state, "playerStates")) ?? {})) {
     if (!isObject(raw)) continue;
@@ -339,14 +395,40 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
     const dev = get(state, "mechanicDevelopmentCardsState", "players", color);
     const owned = Array.isArray(get(isObject(dev) ? dev : {}, "developmentCards", "cards")) ? (get(isObject(dev) ? dev : {}, "developmentCards", "cards") as unknown[]) : [];
     const used = Array.isArray(get(isObject(dev) ? dev : {}, "developmentCardsUsed")) ? (get(isObject(dev) ? dev : {}, "developmentCardsUsed") as unknown[]) : [];
-    const devCards = owned.every((c) => DEV_CARD[num(c) ?? -1]) ? owned.map((c) => DEV_CARD[num(c) ?? -1]) : undefined;
+    const boughtRaw = get(isObject(dev) ? dev : {}, "developmentCardsBoughtThisTurn");
+    const boughtList = Array.isArray(boughtRaw) ? boughtRaw : [];
+    const identifiedOwned = owned.map((c) => DEV_CARD[num(c) ?? -1]).filter((k): k is DevCardKind => Boolean(k));
+    const unknownDevsInHand = Math.max(0, owned.length - identifiedOwned.length);
+    const devCards = unknownDevsInHand === 0 ? identifiedOwned : identifiedOwned.length > 0 ? identifiedOwned : undefined;
+    const devsBoughtThisTurn = boughtList.map((c) => DEV_CARD[num(c) ?? -1]).filter((k): k is DevCardKind => Boolean(k));
+    const hasUsedDevThisTurn = isObject(dev) && dev.hasUsedDevelopmentCardThisTurn === true;
+    const playableDevCards =
+      devCards === undefined
+        ? undefined
+        : (() => {
+            if (hasUsedDevThisTurn) return identifiedOwned.filter((k) => k === "victoryPoint");
+            const rem = [...identifiedOwned];
+            for (const b of devsBoughtThisTurn) {
+              if (b === "victoryPoint") continue;
+              const idx = rem.indexOf(b);
+              if (idx >= 0) rem.splice(idx, 1);
+            }
+            return rem;
+          })();
     const knights = used.filter((c) => (DEV_CARD[num(c) ?? -1] ?? "") === "knight").length;
     const road = get(state, "mechanicLongestRoadState", color);
     const army = get(state, "mechanicLargestArmyState", color);
     const piece = (group: string, field: string) => num(get(state, group, color, field));
+    const vpBreak = breakdownVp(raw.victoryPointsState) ?? breakdownVp(raw.victoryPoints);
+    const visibleVp = vpBreak?.visibleVp ?? 0;
+    const identifiedVpCards = identifiedOwned.filter((c) => c === "victoryPoint").length;
+    const hiddenVp = Math.max(vpBreak?.hiddenVp ?? 0, identifiedVpCards);
+    const vp = visibleVp + hiddenVp;
     players.push({
       id,
-      vp: sumVp(raw.victoryPointsState) ?? sumVp(raw.victoryPoints) ?? 0,
+      vp,
+      visibleVp,
+      hiddenVp,
       handSize: Array.isArray(cards) ? cards.length : 0,
       ratios,
       roadLength: num(isObject(road) ? road.longestRoad : undefined) ?? 0,
@@ -354,13 +436,17 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
       army: num(isObject(army) ? army.armySize ?? army.largestArmy : undefined) ?? knights,
       hasLargestArmy: isObject(army) && army.hasLargestArmy === true,
       devsInHand: owned.length,
+      unknownDevsInHand,
       devsPlayed: used.length,
       knights,
       devCards,
+      playableDevCards,
+      devsBoughtThisTurn: devsBoughtThisTurn.length > 0 ? devsBoughtThisTurn : undefined,
+      hasUsedDevThisTurn: hasUsedDevThisTurn ? true : undefined,
       settlementsLeft: piece("mechanicSettlementState", "bankSettlementAmount"),
       citiesLeft: piece("mechanicCityState", "bankCityAmount"),
       roadsLeft: piece("mechanicRoadState", "bankRoadAmount"),
-      discardLimit: num(raw.cardDiscardLimit)
+      discardLimit: num(raw.cardDiscardLimit) ?? gameSettings?.cardDiscardLimit
     });
   }
   const bankRaw = get(state, "bankState", "resourceCards");
@@ -383,7 +469,8 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
     turnState: isObject(current) ? num(current.turnState) : undefined,
     actionState: isObject(current) ? num(current.actionState) : undefined,
     completedTurns: isObject(current) ? num(current.completedTurns) : undefined,
-    robberHex: robber === undefined ? undefined : String(robber)
+    robberHex: robber === undefined ? undefined : String(robber),
+    gameSettings
   };
 }
 
