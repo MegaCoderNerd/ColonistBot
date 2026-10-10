@@ -18,6 +18,7 @@ import { contextFor, isLegal } from "../src/analyzer/strategy";
 import { buildNet, listOpenEdges, longestExtensions, longestRoad, networkLength, adviseRoad } from "../src/analyzer/engine/roads";
 import { bagState } from "../src/analyzer/engine/value";
 import { planTurn, playableCardsOf, roadBattle } from "../src/analyzer/engine/decide";
+import { act, buyDev, endTurn, newPlayer, playDev, race, updateLargestArmy } from "../src/analyzer/engine/sim";
 import type { Board, Placements } from "../src/analyzer/types";
 import type { Recording } from "../src/shared/schema";
 
@@ -28,7 +29,7 @@ function loadRecordings(): Recording[] {
   return raw.recordings;
 }
 
-describe("Stage 2 — Acceptance Tests (Steps 2.1–2.4 Implemented)", () => {
+describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
   const recordings = loadRecordings();
 
   describe("1. [ACCEPTANCE — Step 2.1] Victory-Point Accounting & Visible vs. Confirmed Hidden VP", () => {
@@ -782,12 +783,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.4 Implemented)", () => {
       expect([...parser.players.keys()]).toEqual(["Megalovania", "AHeck"]);
     });
   });
-});
-
-describe("Stage 2 — Pending Step 2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
-  const recordings = loadRecordings();
-
-  describe("8. [ACCEPTANCE] Robber Rules & Award Transfer Thresholds", () => {
+  describe("8. [ACCEPTANCE — Step 2.5] Robber Rules, Simulator Largest Army Transfers & Dev-Card Timing", () => {
     const farm = recordings.find((r) => r.id === "farm9373")!;
     const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
     const board: Board = parsed.board!;
@@ -819,13 +815,176 @@ describe("Stage 2 — Pending Step 2.5 (Acceptance Specifications & Documented B
       expect(targets.some((t) => t.hexId === currentRobber)).toBe(false);
     });
 
-    it("enforces strict > overtake threshold for Longest Road (>= 5) and Largest Army (>= 3)", () => {
+    it("enforces strict > overtake threshold for Longest Road (>= 5) in live roadBattle", () => {
       const claim4 = roadBattle(4, 3, false, false);
       expect(claim4.worth).toBe(true);
       expect(claim4.roadsNeeded).toBe(1);
 
       const overtake5 = roadBattle(4, 5, false, true);
       expect(overtake5.roadsNeeded).toBe(2);
+    });
+
+    it("[ACCEPTANCE — Step 2.5] enforces Largest Army first claim at 3 Knights, preserves incumbent on ties, transfers +-2 VP on strict overtake, and prevents simultaneous holders in sim.ts", () => {
+      const a = newPlayer({ vp: 2, readyDevs: ["knight", "knight", "knight", "knight"] });
+      const b = newPlayer({ vp: 2, readyDevs: ["knight", "knight", "knight", "knight", "knight"] });
+      const rng = () => 0.1;
+
+      // Turn 1-2 for A: 1st and 2nd played Knights do not claim Largest Army
+      expect(playDev(a, b, rng)).toBe(true);
+      endTurn(a);
+      expect(a.knights).toBe(1);
+      expect(a.hasArmy).toBe(false);
+      expect(a.vp).toBe(2);
+
+      expect(playDev(a, b, rng)).toBe(true);
+      endTurn(a);
+      expect(a.knights).toBe(2);
+      expect(a.hasArmy).toBe(false);
+      expect(a.vp).toBe(2);
+
+      // Turn 3 for A: 3rd Knight claims unclaimed Largest Army (+2 VP)
+      expect(playDev(a, b, rng)).toBe(true);
+      endTurn(a);
+      expect(a.knights).toBe(3);
+      expect(a.hasArmy).toBe(true);
+      expect(a.vp).toBe(4);
+      expect(b.hasArmy).toBe(false);
+      expect(b.vp).toBe(2);
+
+      // B plays 3 Knights across 3 turns (reaches tie 3 vs 3): incumbent A is preserved, B does not get Largest Army
+      for (let i = 1; i <= 3; i++) {
+        act(b, a, rng);
+        endTurn(b);
+        expect(b.knights).toBe(i);
+        expect(a.hasArmy && b.hasArmy).toBe(false);
+      }
+      expect(b.knights).toBe(3);
+      expect(a.hasArmy).toBe(true);
+      expect(a.vp).toBe(4);
+      expect(b.hasArmy).toBe(false);
+      expect(b.vp).toBe(2);
+
+      // B plays 4th Knight via act(): strictly exceeds incumbent A (4 > 3) -> removes 2 VP from A, awards 2 VP to B
+      act(b, a, rng);
+      endTurn(b);
+      expect(b.knights).toBe(4);
+      expect(a.hasArmy).toBe(false);
+      expect(a.vp).toBe(2);
+      expect(b.hasArmy).toBe(true);
+      expect(b.vp).toBe(4);
+      expect(a.hasArmy && b.hasArmy).toBe(false);
+
+      // A plays 4th Knight (tie 4 vs 4): incumbent B is preserved
+      act(a, b, rng);
+      endTurn(a);
+      expect(a.knights).toBe(4);
+      expect(b.hasArmy).toBe(true);
+      expect(b.vp).toBe(4);
+      expect(a.hasArmy).toBe(false);
+      expect(a.vp).toBe(2);
+    });
+
+    it("[ACCEPTANCE — Step 2.5] separates dev-card purchase from play, enforces 1 action dev card per turn, allows playing an older card when buying a new one, and promotes bought cards on endTurn", () => {
+      // 1. Buying an action dev card during act() never plays it on the same turn, even with enough resources to buy multiple cards
+      const buyer = newPlayer({
+        vp: 2,
+        hand: { lumber: 0, brick: 0, wool: 3, grain: 3, ore: 3 },
+        expansions: [{ prods: [], pip: 8, roads: 2 }]
+      });
+      const opp = newPlayer({ vp: 2 });
+      // rng returning 0.1 draws Knights (< 14/25)
+      act(buyer, opp, () => 0.1);
+      expect(buyer.devs).toBeGreaterThanOrEqual(1);
+      expect(buyer.boughtDevs.length).toBe(buyer.devs);
+      expect(buyer.readyDevs).toEqual([]);
+      expect(buyer.knights).toBe(0);
+      expect(buyer.playedDevThisTurn).toBe(false);
+      // Attempting playDev before endTurn fails because newly bought cards are not in readyDevs
+      expect(playDev(buyer, opp, () => 0.1)).toBe(false);
+
+      // After endTurn, boughtDevs move into readyDevs
+      endTurn(buyer);
+      expect(buyer.boughtDevs).toEqual([]);
+      expect(buyer.readyDevs.length).toBe(buyer.devs);
+
+      // 2. Multiple ready action cards: at most 1 non-VP dev card can be played in a single turn, even across recursive act() calls
+      const multi = newPlayer({
+        vp: 2,
+        readyDevs: ["knight", "roadBuilding", "yearOfPlenty"],
+        hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 }
+      });
+      act(multi, opp, () => 0.1);
+      expect(multi.playedDevThisTurn).toBe(true);
+      expect(multi.knights).toBe(1);
+      expect(multi.progress).toBe(0); // roadBuilding was NOT played on the same turn
+      expect(multi.readyDevs).toEqual(["roadBuilding", "yearOfPlenty"]);
+      expect(multi.boughtDevs).toEqual(["knight"]); // also bought a new knight on the same turn!
+      expect(playDev(multi, opp, () => 0.1)).toBe(false);
+
+      // Next turn after endTurn: roadBuilding is played (1 per turn), newly bought knight is now in readyDevs
+      endTurn(multi);
+      expect(multi.playedDevThisTurn).toBe(false);
+      expect(multi.readyDevs).toEqual(["roadBuilding", "yearOfPlenty", "knight"]);
+      act(multi, opp, () => 0.1);
+      expect(multi.playedDevThisTurn).toBe(true);
+      expect(multi.progress).toBe(2);
+      expect(multi.readyDevs).toEqual(["yearOfPlenty", "knight"]);
+
+      // 3. Buying a new card first on a turn still allows playing a card already held from a previous turn
+      const buyThenPlay = newPlayer({
+        vp: 2,
+        readyDevs: ["knight"]
+      });
+      expect(buyDev(buyThenPlay, () => 20 / 25)).toBe("roadBuilding");
+      expect(buyThenPlay.boughtDevs).toEqual(["roadBuilding"]);
+      expect(buyThenPlay.readyDevs).toEqual(["knight"]);
+      expect(playDev(buyThenPlay, opp, () => 0.1)).toBe(true);
+      expect(buyThenPlay.knights).toBe(1);
+      expect(buyThenPlay.readyDevs).toEqual([]);
+      expect(buyThenPlay.boughtDevs).toEqual(["roadBuilding"]);
+      // Cannot play the newly bought roadBuilding on the same turn even if playedDevThisTurn were false
+      expect(playDev(buyThenPlay, opp, () => 0.1)).toBe(false);
+
+      // 4. Purchased Victory Point card adds +1 VP immediately
+      const vpBuyer = newPlayer({ vp: 2 });
+      expect(buyDev(vpBuyer, () => 15 / 25)).toBe("victoryPoint");
+      expect(vpBuyer.vp).toBe(3);
+      expect(vpBuyer.boughtDevs).toEqual([]);
+      expect(vpBuyer.readyDevs).toEqual([]);
+    });
+
+    it("[ACCEPTANCE — Step 2.5] classifies standard 25-card deck categories accurately and preserves Monopoly without resolving it as Year of Plenty", () => {
+      const p = newPlayer({ vp: 2 });
+      const opp = newPlayer({ vp: 2 });
+
+      // 0..13/25 -> Knight (14 cards)
+      expect(buyDev(p, () => 0 / 25)).toBe("knight");
+      expect(buyDev(p, () => 13.9 / 25)).toBe("knight");
+      // 14..18/25 -> Victory Point (5 cards)
+      expect(buyDev(p, () => 14 / 25)).toBe("victoryPoint");
+      expect(buyDev(p, () => 18.9 / 25)).toBe("victoryPoint");
+      // 19..20/25 -> Road Building (2 cards)
+      expect(buyDev(p, () => 19 / 25)).toBe("roadBuilding");
+      expect(buyDev(p, () => 20.9 / 25)).toBe("roadBuilding");
+      // 21..22/25 -> Year of Plenty (2 cards)
+      expect(buyDev(p, () => 21 / 25)).toBe("yearOfPlenty");
+      expect(buyDev(p, () => 22.9 / 25)).toBe("yearOfPlenty");
+      // 23..24/25 -> Monopoly (2 cards)
+      expect(buyDev(p, () => 23 / 25)).toBe("monopoly");
+      expect(buyDev(p, () => 24.9 / 25)).toBe("monopoly");
+
+      // Monopoly alone in readyDevs is preserved as "monopoly" and never resolved as Year of Plenty
+      const monoHolder = newPlayer({ vp: 2, readyDevs: ["monopoly"] });
+      expect(playDev(monoHolder, opp, () => 0)).toBe(false);
+      expect(monoHolder.playedDevThisTurn).toBe(false);
+      expect(monoHolder.readyDevs).toEqual(["monopoly"]);
+      expect(Object.values(monoHolder.hand).reduce((a, b) => a + b, 0)).toBe(0);
+
+      // When Monopoly precedes a Knight in readyDevs, playDev skips Monopoly (preserving it) and plays the Knight
+      const mixedHolder = newPlayer({ vp: 2, readyDevs: ["monopoly", "knight"] });
+      expect(playDev(mixedHolder, opp, () => 0)).toBe(true);
+      expect(mixedHolder.knights).toBe(1);
+      expect(mixedHolder.readyDevs).toEqual(["monopoly"]);
     });
   });
 });

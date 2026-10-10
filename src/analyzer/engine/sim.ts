@@ -25,6 +25,8 @@ export interface SimExpansion {
   at?: string;
 }
 
+export type SimActionDev = "knight" | "roadBuilding" | "yearOfPlenty" | "monopoly";
+
 export interface SimPlayer {
   buildings: SimBuilding[];
   expansions: SimExpansion[];
@@ -38,6 +40,9 @@ export interface SimPlayer {
   hasRoad: boolean;
   hasArmy: boolean;
   blocked: number | null;
+  readyDevs: SimActionDev[];
+  boughtDevs: SimActionDev[];
+  playedDevThisTurn: boolean;
 }
 
 export interface RaceOptions {
@@ -69,6 +74,9 @@ export function newPlayer(partial: Partial<SimPlayer> = {}): SimPlayer {
     hasRoad: false,
     hasArmy: false,
     blocked: null,
+    readyDevs: [],
+    boughtDevs: [],
+    playedDevThisTurn: false,
     ...partial
   };
 }
@@ -79,7 +87,9 @@ export function clonePlayer(p: SimPlayer): SimPlayer {
     hand: { ...p.hand },
     ratios: { ...p.ratios },
     buildings: p.buildings.map((b) => ({ ...b, prods: b.prods.map((x) => ({ ...x })) })),
-    expansions: p.expansions.map((e) => ({ ...e, prods: e.prods.map((x) => ({ ...x })) }))
+    expansions: p.expansions.map((e) => ({ ...e, prods: e.prods.map((x) => ({ ...x })) })),
+    readyDevs: [...p.readyDevs],
+    boughtDevs: [...p.boughtDevs]
   };
 }
 
@@ -231,28 +241,88 @@ function road(p: SimPlayer, opponent: SimPlayer): boolean {
   return true;
 }
 
-function dev(p: SimPlayer, rng: () => number) {
-  p.devs++;
-  const roll = rng();
-  if (roll < 14 / 25) {
-    p.knights++;
-    if (p.knights >= 3 && !p.hasArmy) {
+export function updateLargestArmy(p: SimPlayer, opponent: SimPlayer) {
+  if (p.knights < 3) return;
+  if (p.hasArmy) {
+    if (opponent.hasArmy) {
+      opponent.hasArmy = false;
+      opponent.vp -= 2;
+    }
+    return;
+  }
+  if (!opponent.hasArmy) {
+    if (p.knights > opponent.knights) {
       p.hasArmy = true;
       p.vp += 2;
     }
-  } else if (roll < 19 / 25) p.vp++;
-  else if (roll < 21 / 25) p.progress += 2;
-  else {
+    return;
+  }
+  if (p.knights > opponent.knights) {
+    opponent.hasArmy = false;
+    opponent.vp -= 2;
+    p.hasArmy = true;
+    p.vp += 2;
+  }
+}
+
+export function buyDev(p: SimPlayer, rng: () => number): SimActionDev | "victoryPoint" {
+  p.devs++;
+  const roll = rng();
+  if (roll < 14 / 25) {
+    p.boughtDevs.push("knight");
+    return "knight";
+  }
+  if (roll < 19 / 25) {
+    p.vp++;
+    return "victoryPoint";
+  }
+  if (roll < 21 / 25) {
+    p.boughtDevs.push("roadBuilding");
+    return "roadBuilding";
+  }
+  if (roll < 23 / 25) {
+    p.boughtDevs.push("yearOfPlenty");
+    return "yearOfPlenty";
+  }
+  // Monopoly (2 of 25): preserve distinct card identity without resolving as Year of Plenty.
+  // Deck depletion (drawing without replacement from a shared 25-card deck) and Monopoly's
+  // resource-stealing heuristic are deferred to the spatial simulator replacement.
+  p.boughtDevs.push("monopoly");
+  return "monopoly";
+}
+
+export function playDev(p: SimPlayer, opponent: SimPlayer, rng: () => number): boolean {
+  if (p.playedDevThisTurn || !p.readyDevs.length) return false;
+  const idx = p.readyDevs.findIndex((c) => c !== "monopoly");
+  if (idx < 0) return false;
+  const [card] = p.readyDevs.splice(idx, 1);
+  p.playedDevThisTurn = true;
+  if (card === "knight") {
+    p.knights++;
+    updateLargestArmy(p, opponent);
+  } else if (card === "roadBuilding") {
+    p.progress += 2;
+  } else if (card === "yearOfPlenty") {
     const r = RESOURCES[Math.floor(rng() * RESOURCES.length)];
     p.hand[r] += 2;
   }
+  return true;
+}
+
+export function endTurn(p: SimPlayer) {
+  if (p.boughtDevs.length) {
+    p.readyDevs.push(...p.boughtDevs);
+    p.boughtDevs.length = 0;
+  }
+  p.playedDevThisTurn = false;
 }
 
 const pipTotal = (p: SimPlayer, pred: (r: Resource) => boolean) =>
   p.buildings.reduce((s, b) => s + b.prods.reduce((t, prod) => t + (pred(prod.resource) ? pips(prod.number) * prod.weight : 0), 0), 0);
 
-function act(p: SimPlayer, opponent: SimPlayer, rng: () => number, depth = 0) {
+export function act(p: SimPlayer, opponent: SimPlayer, rng: () => number, depth = 0) {
   if (depth >= 4 || p.vp >= 15) return;
+  if (!p.playedDevThisTurn && playDev(p, opponent, rng) && p.vp >= 15) return;
   const exp = p.expansions[0];
   const oreWheat = pipTotal(p, (r) => r === "ore" || r === "grain");
   const canCity = p.buildings.some((b) => !b.city);
@@ -272,7 +342,7 @@ function act(p: SimPlayer, opponent: SimPlayer, rng: () => number, depth = 0) {
     return;
   }
   if (p.devs < 7 && p.knights < 4 && acquire(p, DEV, 3)) {
-    dev(p, rng);
+    buyDev(p, rng);
     act(p, opponent, rng, depth + 1);
     return;
   }
@@ -315,6 +385,7 @@ export function race(a0: SimPlayer, b0: SimPlayer, options: RaceOptions = {}): {
         produce(b, roll);
       }
       act(roller, other, rng);
+      endTurn(roller);
       if (a.vp >= goal && at === maxTurns) at = t;
       if (b.vp >= goal && bt === maxTurns) bt = t;
     }
