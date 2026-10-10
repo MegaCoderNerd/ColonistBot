@@ -1,6 +1,6 @@
 // Recovered from content.js (lines 4950-4957)
 // [RECONSTRUCTED TYPE DECLARATIONS]
-import type { DevCardKind, Resource, ResourceBag } from "./types";
+import type { DevCardKind, Resource, ResourceBag, ResourceHand } from "./types";
 
 export const RESOURCE_BY_ID: Record<number, Resource> = {
   1: "lumber",
@@ -16,6 +16,7 @@ export interface PlayerSnapshot {
   visibleVp: number;
   hiddenVp: number;
   handSize: number;
+  hand?: ResourceHand;
   ratios: ResourceBag;
   roadLength: number;
   hasLongestRoad: boolean;
@@ -24,11 +25,14 @@ export interface PlayerSnapshot {
   devsInHand: number;
   unknownDevsInHand: number;
   devsPlayed: number;
+  devsPlayedCards?: DevCardKind[];
   knights: number;
   devCards?: DevCardKind[];
   playableDevCards?: DevCardKind[];
   devsBoughtThisTurn?: DevCardKind[];
+  unknownDevsBoughtThisTurn?: number;
   hasUsedDevThisTurn?: boolean;
+  isTakingAction?: boolean;
   settlementsLeft?: number;
   citiesLeft?: number;
   roadsLeft?: number;
@@ -53,6 +57,7 @@ export interface GameSettingsSnapshot {
 export interface GameSnapshot {
   players: PlayerSnapshot[];
   bank?: ResourceBag;
+  bankDevsLeft?: number;
   dice?: { thrown: boolean; d1?: number; d2?: number };
   turnPlayer?: string;
   turnState?: number;

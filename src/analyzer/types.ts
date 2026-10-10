@@ -27,6 +27,9 @@ export interface Board {
   hexes: HexTile[];
   ports?: PortEdge[];
   robberStart?: string;
+  cornerIds?: Record<string, string>;
+  edgeIds?: Record<string, string>;
+  portIds?: Record<string, string>;
 }
 
 export interface PlayerInfo {

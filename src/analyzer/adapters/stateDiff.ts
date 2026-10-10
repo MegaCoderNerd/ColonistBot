@@ -392,6 +392,17 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
       }
     }
     const cards = get(raw, "resourceCards", "cards");
+    const exactHand =
+      Array.isArray(cards) && cards.every((c) => Boolean(RESOURCE_BY_ID[num(c) ?? -1]))
+        ? cards.reduce(
+            (acc, c) => {
+              const res = RESOURCE_BY_ID[num(c) ?? -1]!;
+              acc[res]++;
+              return acc;
+            },
+            { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 }
+          )
+        : undefined;
     const dev = get(state, "mechanicDevelopmentCardsState", "players", color);
     const owned = Array.isArray(get(isObject(dev) ? dev : {}, "developmentCards", "cards")) ? (get(isObject(dev) ? dev : {}, "developmentCards", "cards") as unknown[]) : [];
     const used = Array.isArray(get(isObject(dev) ? dev : {}, "developmentCardsUsed")) ? (get(isObject(dev) ? dev : {}, "developmentCardsUsed") as unknown[]) : [];
@@ -401,7 +412,10 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
     const unknownDevsInHand = Math.max(0, owned.length - identifiedOwned.length);
     const devCards = unknownDevsInHand === 0 ? identifiedOwned : identifiedOwned.length > 0 ? identifiedOwned : undefined;
     const devsBoughtThisTurn = boughtList.map((c) => DEV_CARD[num(c) ?? -1]).filter((k): k is DevCardKind => Boolean(k));
+    const unknownDevsBoughtThisTurn = Math.max(0, boughtList.length - devsBoughtThisTurn.length);
+    const devsPlayedCards = used.map((c) => DEV_CARD[num(c) ?? -1] ?? "unknown");
     const hasUsedDevThisTurn = isObject(dev) && dev.hasUsedDevelopmentCardThisTurn === true;
+    const isTakingAction = raw.isTakingAction === true;
     const playableDevCards =
       devCards === undefined
         ? undefined
@@ -430,6 +444,7 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
       visibleVp,
       hiddenVp,
       handSize: Array.isArray(cards) ? cards.length : 0,
+      ...(exactHand ? { hand: exactHand } : {}),
       ratios,
       roadLength: num(isObject(road) ? road.longestRoad : undefined) ?? 0,
       hasLongestRoad: isObject(road) && road.hasLongestRoad === true,
@@ -438,11 +453,14 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
       devsInHand: owned.length,
       unknownDevsInHand,
       devsPlayed: used.length,
+      devsPlayedCards: devsPlayedCards.length > 0 ? devsPlayedCards : undefined,
       knights,
       devCards,
       playableDevCards,
       devsBoughtThisTurn: devsBoughtThisTurn.length > 0 ? devsBoughtThisTurn : undefined,
+      unknownDevsBoughtThisTurn: unknownDevsBoughtThisTurn > 0 ? unknownDevsBoughtThisTurn : undefined,
       hasUsedDevThisTurn: hasUsedDevThisTurn ? true : undefined,
+      isTakingAction: isTakingAction ? true : undefined,
       settlementsLeft: piece("mechanicSettlementState", "bankSettlementAmount"),
       citiesLeft: piece("mechanicCityState", "bankCityAmount"),
       roadsLeft: piece("mechanicRoadState", "bankRoadAmount"),
@@ -458,12 +476,15 @@ export function readSnapshot(state: Record<string, unknown>, turnPlayer?: string
       if (resource && count !== undefined) bank[resource] = count;
     }
   }
+  const bankDevsRaw = get(state, "mechanicDevelopmentCardsState", "bankDevelopmentCards", "cards");
+  const bankDevsLeft = Array.isArray(bankDevsRaw) ? bankDevsRaw.length : undefined;
   const dice = get(state, "diceState");
   const current = get(state, "currentState");
   const robber = num(get(state, "mechanicRobberState", "locationTileIndex"));
   return {
     players,
     bank: Object.keys(bank).length ? bank : undefined,
+    bankDevsLeft,
     dice: isObject(dice) ? { thrown: dice.diceThrown === true, d1: num(dice.dice1), d2: num(dice.dice2) } : undefined,
     turnPlayer,
     turnState: isObject(current) ? num(current.turnState) : undefined,
@@ -494,9 +515,30 @@ export function buildBoard(state: Record<string, unknown>, robberStartIndex?: nu
     const [x, y, z] = [num(raw.x), num(raw.y), num(raw.z)];
     return kind && x !== undefined && y !== undefined && z !== undefined ? [{ at: `${x},${y},${z}`, kind }] : [];
   });
+  const cornerIds: Record<string, string> = {};
+  for (const [id, raw] of Object.entries(asRecord(get(state, "mapState", "tileCornerStates")) ?? {})) {
+    if (!isObject(raw)) continue;
+    const [x, y, z] = [num(raw.x), num(raw.y), num(raw.z)];
+    if (x !== undefined && y !== undefined && z !== undefined) cornerIds[id] = `${x},${y},${z}`;
+  }
+  const edgeIds: Record<string, string> = {};
+  for (const [id, raw] of Object.entries(asRecord(get(state, "mapState", "tileEdgeStates")) ?? {})) {
+    if (!isObject(raw)) continue;
+    const [x, y, z] = [num(raw.x), num(raw.y), num(raw.z)];
+    if (x !== undefined && y !== undefined && z !== undefined) edgeIds[id] = `${x},${y},${z}`;
+  }
+  const portIds: Record<string, string> = {};
+  for (const [id, raw] of Object.entries(asRecord(get(state, "mapState", "portEdgeStates")) ?? {})) {
+    if (!isObject(raw)) continue;
+    const [x, y, z] = [num(raw.x), num(raw.y), num(raw.z)];
+    if (x !== undefined && y !== undefined && z !== undefined) portIds[id] = `${x},${y},${z}`;
+  }
   return {
     hexes,
     ports: ports.length ? ports : undefined,
-    robberStart: robberStartIndex !== undefined ? String(robberStartIndex) : desert?.id
+    robberStart: robberStartIndex !== undefined ? String(robberStartIndex) : desert?.id,
+    ...(Object.keys(cornerIds).length ? { cornerIds } : {}),
+    ...(Object.keys(edgeIds).length ? { edgeIds } : {}),
+    ...(Object.keys(portIds).length ? { portIds } : {})
   };
 }
