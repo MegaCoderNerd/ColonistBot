@@ -15,7 +15,7 @@ import {
 import { LogParser, parseRow } from "../src/analyzer/adapters/logText";
 import { placementsFrom, publicVp, robberTargets } from "../src/analyzer/advisor";
 import { contextFor, isLegal } from "../src/analyzer/strategy";
-import { buildNet, listOpenEdges, longestRoad } from "../src/analyzer/engine/roads";
+import { buildNet, listOpenEdges, longestExtensions, longestRoad, networkLength } from "../src/analyzer/engine/roads";
 import { bagState } from "../src/analyzer/engine/value";
 import { planTurn, playableCardsOf, roadBattle } from "../src/analyzer/engine/decide";
 import type { Board, Placements } from "../src/analyzer/types";
@@ -26,37 +26,6 @@ const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08
 function loadRecordings(): Recording[] {
   const raw = JSON.parse(readFileSync(RECORDINGS_PATH, "utf8")) as { recordings: Recording[] };
   return raw.recordings;
-}
-
-/**
- * Reference acceptance specification for Step 2.2 (Edge-Simple Longest Road across all components,
- * stopping traversal through opponent-occupied corners).
- */
-function computeEdgeSimpleLongestRoad(
-  adj: Map<string, Set<string>>,
-  blockedCorners: Set<string> = new Set()
-): number {
-  let best = 0;
-  const usedEdges = new Set<string>();
-  const edgeKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
-
-  const dfs = (u: string, length: number) => {
-    if (length > best) best = length;
-    // Cannot continue THROUGH an opponent-occupied corner after entering it
-    if (length > 0 && blockedCorners.has(u)) return;
-    for (const v of adj.get(u) ?? []) {
-      const k = edgeKey(u, v);
-      if (usedEdges.has(k)) continue;
-      usedEdges.add(k);
-      dfs(v, length + 1);
-      usedEdges.delete(k);
-    }
-  };
-
-  for (const start of adj.keys()) {
-    dfs(start, 0);
-  }
-  return best;
 }
 
 /**
@@ -83,7 +52,7 @@ function computeAuthoritativeOpenEdges(
   return out;
 }
 
-describe("Stage 2 — Acceptance Tests (Step 2.1 Implemented)", () => {
+describe("Stage 2 — Acceptance Tests (Steps 2.1–2.2 Implemented)", () => {
   const recordings = loadRecordings();
 
   describe("1. [ACCEPTANCE — Step 2.1] Victory-Point Accounting & Visible vs. Confirmed Hidden VP", () => {
@@ -406,12 +375,127 @@ describe("Stage 2 — Acceptance Tests (Step 2.1 Implemented)", () => {
       expect(adviceNextTurn.headline.toLowerCase()).toContain("road building");
     });
   });
+
+  describe("5. [ACCEPTANCE — Step 2.2] Longest Road — Disconnected Components, Cycles, and Opponent Splits", () => {
+    it("computes longest edge-simple trail across disconnected components and cycles without merging disconnected networks", () => {
+      // Component 1: 2-edge path (A - B - C)
+      // Component 2: 5-edge cycle + 1 tail (D - E - F - G - H - D, plus D - I) -> longest edge-simple trail = 6
+      const graph = new Map<string, Set<string>>([
+        ["A", new Set(["B"])],
+        ["B", new Set(["A", "C"])],
+        ["C", new Set(["B"])],
+        ["D", new Set(["E", "H", "I"])],
+        ["E", new Set(["D", "F"])],
+        ["F", new Set(["E", "G"])],
+        ["G", new Set(["F", "H"])],
+        ["H", new Set(["G", "D"])],
+        ["I", new Set(["D"])]
+      ]);
+
+      const res = longestRoad(graph);
+      expect(res.len).toBe(6);
+      expect(new Set(res.ends)).toEqual(new Set(["I", "D"]));
+
+      // Single component with 5-cycle + tail
+      const singleComp = new Map<string, Set<string>>([
+        ["I", new Set(["D"])],
+        ["D", new Set(["E", "H", "I"])],
+        ["E", new Set(["D", "F"])],
+        ["F", new Set(["E", "G"])],
+        ["G", new Set(["F", "H"])],
+        ["H", new Set(["G", "D"])]
+      ]);
+      expect(longestRoad(singleComp).len).toBe(6);
+    });
+
+    it("splits a road trail when an opponent settlement occupies an intermediate corner and excludes blocked corners from extendable ends", () => {
+      const graph = new Map<string, Set<string>>([
+        ["c0", new Set(["c1"])],
+        ["c1", new Set(["c0", "c2"])],
+        ["c2", new Set(["c1", "c3"])],
+        ["c3", new Set(["c2", "c4"])],
+        ["c4", new Set(["c3"])]
+      ]);
+
+      // Unblocked: 4-road line from c0 to c4
+      expect(longestRoad(graph)).toEqual({ len: 4, ends: ["c0", "c4"] });
+
+      // Opponent settles on intermediate corner c2, splitting the 4-road line into two 2-road segments (c0-c1-c2 and c2-c3-c4)
+      const splitRes = longestRoad(graph, new Set(["c2"]));
+      expect(splitRes.len).toBe(2);
+      expect(new Set(splitRes.ends)).toEqual(new Set(["c0", "c4"]));
+      expect(splitRes.ends).not.toContain("c2");
+
+      // On a real board, verify networkLength and longestExtensions respect opponent settlement road splits
+      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
+      const board = parsed.board!;
+      const ctx = contextFor(board);
+
+      // Build a 4-road simple path c0 - c1 - c2 - c3 - c4 on the board
+      const c0 = ctx.corners[0].at;
+      const c1 = ctx.nbrs.get(c0)![0];
+      const c2 = ctx.nbrs.get(c1)!.find((x) => x !== c0)!;
+      const c3 = ctx.nbrs.get(c2)!.find((x) => x !== c1 && x !== c0)!;
+      const c4 = ctx.nbrs.get(c3)!.find((x) => x !== c2 && x !== c1 && x !== c0)!;
+      const baseNet = buildNet(board, { settlements: new Map([[c0, "c1"]]), cities: new Map(), roads: new Map() }, "c1")!;
+      const e01 = baseNet.adj.get(c0)!.find((x) => x.to === c1)!.edge;
+      const e12 = baseNet.adj.get(c1)!.find((x) => x.to === c2)!.edge;
+      const e23 = baseNet.adj.get(c2)!.find((x) => x.to === c3)!.edge;
+      const e34 = baseNet.adj.get(c3)!.find((x) => x.to === c4)!.edge;
+
+      const roads = new Map<string, string>([
+        [e01, "c1"],
+        [e12, "c1"],
+        [e23, "c1"],
+        [e34, "c1"]
+      ]);
+      const beforeSplit: Placements = {
+        settlements: new Map([[c0, "c1"]]),
+        cities: new Map(),
+        roads
+      };
+      expect(networkLength(board, beforeSplit, "c1")).toBe(4);
+
+      const afterSplit: Placements = {
+        settlements: new Map([
+          [c0, "c1"],
+          [c2, "c5"]
+        ]),
+        cities: new Map(),
+        roads
+      };
+      expect(networkLength(board, afterSplit, "c1")).toBe(2);
+      const ext = longestExtensions(board, afterSplit, "c1");
+      const c2Edges = new Set((baseNet.adj.get(c2) ?? []).map((x) => x.edge));
+      for (const item of ext) {
+        expect(c2Edges.has(item.edge)).toBe(false);
+      }
+    });
+
+    it("matches Colonist authoritative mechanicLongestRoadState road lengths on captured recordings (edge9896, farm9373, deck7708)", () => {
+      for (const [id, expected] of [
+        ["edge9896", { c1: 10 }],
+        ["farm9373", { c1: 13, c5: 4 }],
+        ["deck7708", { c1: 8 }]
+      ] as const) {
+        const rec = recordings.find((r) => r.id === id)!;
+        const parsed = stateDiffAdapter.parse(decodeFrames(rec.frames).decoded);
+        const placements = placementsFrom(parsed.events);
+        for (const [pid, len] of Object.entries(expected)) {
+          const snapPlayer = parsed.snapshot!.players.find((p) => p.id === pid)!;
+          expect(snapPlayer.roadLength).toBe(len);
+          expect(networkLength(parsed.board!, placements, pid)).toBe(len);
+        }
+      }
+    });
+  });
 });
 
-describe("Stage 2 — Pending Steps 2.2–2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
+describe("Stage 2 — Pending Steps 2.3–2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
   const recordings = loadRecordings();
 
-  describe("5. Dice Roll Extraction, Balanced Deck Cycle, and Pending Step 2.4 LogParser Bot-Prefix Bug", () => {
+  describe("6. Dice Roll Extraction, Balanced Deck Cycle, and Pending Step 2.4 LogParser Bot-Prefix Bug", () => {
     it("[ACCEPTANCE] verifies 100% roll sequence agreement between WebSocket diceState and LogParser (75 rolls in farm9373) and 36-card Balanced Dice cycle", () => {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const { decoded } = decodeFrames(farm.frames);
@@ -466,55 +550,6 @@ describe("Stage 2 — Pending Steps 2.2–2.5 (Acceptance Specifications & Docum
       expect(parseRow("bot PlayfulGrid5655 built a road", 1, "Ashmaki").kind).toBe("unparsed");
       expect(parseRow("bot PlayfulGrid5655 bought development card", 1, "Ashmaki").kind).toBe("unparsed");
       expect(parseRow("bot PlayfulGrid5655 traded: 4 wool for 1 ore", 1, "Ashmaki").kind).toBe("unparsed");
-    });
-  });
-
-  describe("6. [PENDING Step 2.2] Longest Road — Disconnected Components, Cycles, and Opponent Splits", () => {
-    it("[ACCEPTANCE SPEC vs. BASELINE BUG] computes longest edge-simple trail across disconnected components and cycles", () => {
-      // Component 1: 2-edge path (A - B - C)
-      // Component 2: 5-edge cycle + 1 tail (D - E - F - G - H - D, plus D - I) -> longest edge-simple trail = 6
-      const graph = new Map<string, Set<string>>([
-        ["A", new Set(["B"])],
-        ["B", new Set(["A", "C"])],
-        ["C", new Set(["B"])],
-        ["D", new Set(["E", "H", "I"])],
-        ["E", new Set(["D", "F"])],
-        ["F", new Set(["E", "G"])],
-        ["G", new Set(["F", "H"])],
-        ["H", new Set(["G", "D"])],
-        ["I", new Set(["D"])]
-      ]);
-
-      // Acceptance target: edge-simple trail across all components finds length 6 in Component 2
-      expect(computeEdgeSimpleLongestRoad(graph)).toBe(6);
-
-      // Documented baseline bug (to be fixed in Step 2.2): longestRoad(graph) only searches nodes[0] ("A") -> 2,
-      // and on a single component uses vertex-simple DFS -> 5 instead of 6.
-      expect(longestRoad(graph).len).toBe(2);
-      const singleComp = new Map<string, Set<string>>([
-        ["I", new Set(["D"])],
-        ["D", new Set(["E", "H", "I"])],
-        ["E", new Set(["D", "F"])],
-        ["F", new Set(["E", "G"])],
-        ["G", new Set(["F", "H"])],
-        ["H", new Set(["G", "D"])]
-      ]);
-      expect(computeEdgeSimpleLongestRoad(singleComp)).toBe(6);
-      expect(longestRoad(singleComp).len).toBe(5);
-    });
-
-    it("[ACCEPTANCE SPEC vs. BASELINE BUG] splits a road trail when an opponent settlement occupies an intermediate corner", () => {
-      const graph = new Map<string, Set<string>>([
-        ["c0", new Set(["c1"])],
-        ["c1", new Set(["c0", "c2"])],
-        ["c2", new Set(["c1", "c3"])],
-        ["c3", new Set(["c2", "c4"])],
-        ["c4", new Set(["c3"])]
-      ]);
-      // Opponent settles on c2, splitting the 4-road line into two 2-road segments
-      expect(computeEdgeSimpleLongestRoad(graph, new Set(["c2"]))).toBe(2);
-      // Documented baseline bug: longestRoad has no blocked-corner awareness and returns 4
-      expect(longestRoad(graph).len).toBe(4);
     });
   });
 

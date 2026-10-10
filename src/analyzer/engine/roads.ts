@@ -117,7 +117,7 @@ export function buildNet(board: Board, placements: Placements, me: string, from?
     }
     return undefined;
   };
-  return { firstStep, mine, graph, length: longestRoad(graph).len, blocked, adj };
+  return { firstStep, mine, graph, length: longestRoad(graph, blocked).len, blocked, adj };
 }
 
 export function listOpenEdges(
@@ -149,11 +149,11 @@ export function networkLength(board: Board, placements: Placements, me: string):
 export function longestExtensions(board: Board, placements: Placements, me: string): Array<{ edge: string; to: string }> {
   const net = buildNet(board, placements, me);
   if (!net) return [];
-  const chain = longestRoad(net.graph);
+  const chain = longestRoad(net.graph, net.blocked);
   const out: Array<{ edge: string; to: string }> = [];
   const seen = new Set<string>();
   for (const end of chain.ends) {
-    if (!net.mine.has(end)) continue;
+    if (!net.mine.has(end) || net.blocked.has(end)) continue;
     for (const next of net.adj.get(end) ?? []) {
       if (net.blocked.has(next.to) || net.graph.get(end)?.has(next.to) || seen.has(next.edge)) continue;
       seen.add(next.edge);
@@ -248,12 +248,13 @@ export function adviseRoad(
       (step) => `Build the highlighted road toward the ${port.text}. ${left(step.dist)}`
     );
   }
-  const chain = longestRoad(graph);
+  const chain = longestRoad(graph, blocked);
   const mineLen = Math.max(opts.myRoadLength ?? 0, chain.len);
   const oppLen = opts.oppRoadLength ?? 0;
   const takesTrophy = !opts.iHold && mineLen + 1 >= 5 && mineLen + 1 > oppLen;
   if (takesTrophy) {
     for (const end of chain.ends) {
+      if (blocked.has(end)) continue;
       for (const next of adj.get(end) ?? []) {
         if (blocked.has(next.to) || graph.get(end)?.has(next.to)) continue;
         if (!mine.has(end)) continue;
@@ -275,25 +276,32 @@ export function adviseRoad(
   return { edge: best.step.edge, toward: best.toward, reason: best.reason };
 }
 
-export function longestRoad(graph: Map<string, Set<string>>): { len: number; ends: string[] } {
+export function longestRoad(graph: Map<string, Set<string>>, blocked?: Set<string>): { len: number; ends: string[] } {
   const nodes = [...graph.keys()];
   if (!nodes.length) return { len: 0, ends: [] };
-  const far = (start: string) => {
-    let best = { node: start, len: 0 };
-    const seen = new Set([start]);
-    const walk = (n: string, d: number) => {
-      if (d > best.len) best = { node: n, len: d };
-      for (const next of graph.get(n) ?? []) {
-        if (seen.has(next)) continue;
-        seen.add(next);
-        walk(next, d + 1);
-        seen.delete(next);
-      }
-    };
-    walk(start, 0);
-    return best;
+  let bestLen = 0;
+  const ends = new Set<string>();
+  const usedEdges = new Set<string>();
+  const walk = (start: string, n: string, d: number) => {
+    if (d > bestLen) {
+      bestLen = d;
+      ends.clear();
+    }
+    if (d === bestLen) {
+      if (!blocked?.has(start)) ends.add(start);
+      if (!blocked?.has(n)) ends.add(n);
+    }
+    if (d > 0 && blocked?.has(n)) return;
+    for (const next of graph.get(n) ?? []) {
+      const edge = pair(n, next);
+      if (usedEdges.has(edge)) continue;
+      usedEdges.add(edge);
+      walk(start, next, d + 1);
+      usedEdges.delete(edge);
+    }
   };
-  const a = far(nodes[0]);
-  const b = far(a.node);
-  return { len: b.len, ends: a.node === b.node ? [a.node] : [a.node, b.node] };
+  for (const start of nodes) {
+    walk(start, start, 0);
+  }
+  return { len: bestLen, ends: [...ends] };
 }

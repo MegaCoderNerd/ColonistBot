@@ -50,13 +50,14 @@ function splitModules(bundle: string): Map<string, string> {
   return map;
 }
 
-const STEP_2_1_MODIFIED_MODULES = new Set([
+const STAGE_2_MODIFIED_MODULES = new Set([
   "// src/analyzer/snapshot.ts",
   "// src/analyzer/adapters/stateDiff.ts",
-  "// src/analyzer/engine/decide.ts"
+  "// src/analyzer/engine/decide.ts",
+  "// src/analyzer/engine/roads.ts"
 ]);
 
-describe("Stage 1 & Step 2.1 — Baseline Bundle & Runtime Parity", () => {
+describe("Stage 1 & Steps 2.1–2.2 — Baseline Bundle & Runtime Parity", () => {
   it("produces byte-identical bundles for inject.js, background.js, and popup/popup.js", () => {
     for (const rel of ["inject.js", "background.js", "popup/popup.js"]) {
       const base = normalizeBundle(readFileSync(resolve(ROOT, rel), "utf8"));
@@ -65,7 +66,7 @@ describe("Stage 1 & Step 2.1 — Baseline Bundle & Runtime Parity", () => {
     }
   });
 
-  it("preserves identical module order (all 34 src/ modules) and 100% AST/token parity on all 31 untouched modules in dist/firefox/content.js", () => {
+  it("preserves identical module order (all 34 src/ modules) and 100% AST/token parity on all 30 untouched modules in dist/firefox/content.js", () => {
     const base = normalizeBundle(readFileSync(resolve(ROOT, "content.js"), "utf8"));
     const built = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
     const baseHeaders = base.split("\n").filter((l) => l.startsWith("  // src/"));
@@ -77,7 +78,7 @@ describe("Stage 1 & Step 2.1 — Baseline Bundle & Runtime Parity", () => {
     const builtMods = splitModules(built);
 
     for (const [header, baseCode] of baseMods.entries()) {
-      if (STEP_2_1_MODIFIED_MODULES.has(header)) continue;
+      if (STAGE_2_MODIFIED_MODULES.has(header)) continue;
       const builtCode = builtMods.get(header);
       expect(builtCode, `Missing module ${header}`).toBeDefined();
       if (header === "__preamble__") {
