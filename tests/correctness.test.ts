@@ -12,7 +12,7 @@ import {
   sumVp,
   VP_CATEGORY_WEIGHT
 } from "../src/analyzer/adapters/stateDiff";
-import { LogParser, parseRow } from "../src/analyzer/adapters/logText";
+import { LogParser, normalizeRow, parseRow } from "../src/analyzer/adapters/logText";
 import { placementsFrom, publicVp, robberTargets } from "../src/analyzer/advisor";
 import { contextFor, isLegal } from "../src/analyzer/strategy";
 import { buildNet, listOpenEdges, longestExtensions, longestRoad, networkLength, adviseRoad } from "../src/analyzer/engine/roads";
@@ -28,7 +28,7 @@ function loadRecordings(): Recording[] {
   return raw.recordings;
 }
 
-describe("Stage 2 — Acceptance Tests (Steps 2.1–2.3 Implemented)", () => {
+describe("Stage 2 — Acceptance Tests (Steps 2.1–2.4 Implemented)", () => {
   const recordings = loadRecordings();
 
   describe("1. [ACCEPTANCE — Step 2.1] Victory-Point Accounting & Visible vs. Confirmed Hidden VP", () => {
@@ -530,16 +530,12 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.3 Implemented)", () => {
       expect(adviceFromBlocked).toBeUndefined();
     });
   });
-});
 
-describe("Stage 2 — Pending Steps 2.4–2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
-  const recordings = loadRecordings();
-
-  describe("7. Dice Roll Extraction, Balanced Deck Cycle, and Pending Step 2.4 LogParser Bot-Prefix Bug", () => {
-    it("[ACCEPTANCE] verifies 100% roll sequence agreement between WebSocket diceState and LogParser (75 rolls in farm9373) and 36-card Balanced Dice cycle", () => {
+  describe("7. [ACCEPTANCE — Step 2.4] Dice Roll Extraction, Balanced Deck Cycle, and Game-Log Parser Corrections", () => {
+    it("verifies 100% roll sequence agreement between WebSocket diceState and LogParser (75 rolls in farm9373) and 36-card Balanced Dice cycle", () => {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const { decoded } = decodeFrames(farm.frames);
-      const stateParsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
+      const stateParsed = stateDiffAdapter.parse(decoded);
       const wsRolls = stateParsed.events.filter((e) => e.type === "roll");
 
       const logParser = new LogParser(farm.meta.me);
@@ -578,20 +574,218 @@ describe("Stage 2 — Pending Steps 2.4–2.5 (Acceptance Specifications & Docum
       expect(restarted.sevensLeft).toBe(6);
     });
 
-    it("[PENDING Step 2.4 — Acceptance Spec vs. Baseline Bug] documents LogParser ACTOR regex failure on bot-prefixed action rows", () => {
-      // Acceptance target once Step 2.4 strips leading `bot ` before matching action patterns:
-      const normalizeBotRow = (raw: string) => raw.replace(/^(?:bot|player|icon[_a-z0-9-]*)\s+/i, "");
-      expect(parseRow(normalizeBotRow("bot PlayfulGrid5655 built a road"), 1, "Ashmaki")).toMatchObject({
+    it("parses bot-prefixed action rows, trophy win rows, Longest Road / Largest Army transfers, and Rush-mode Dice rolls without creating phantom players", () => {
+      // 1. bot <Player> ... action rows (representative real rows from play277, steal1277, road5055)
+      expect(normalizeRow("bot PlayfulGrid5655 built a road")).toBe("PlayfulGrid5655 built a road");
+      expect(parseRow("bot PlayfulGrid5655 built a road", 1, "Ashmaki")).toEqual({
         kind: "event",
-        draft: { type: "build", player: "PlayfulGrid5655", piece: "road" }
+        draft: { type: "build", player: "PlayfulGrid5655", piece: "road", setup: false },
+        subject: "PlayfulGrid5655"
+      });
+      expect(parseRow("bot zoyazor rolled dice_2 dice_1", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "roll", player: "zoyazor", d1: 2, d2: 1, total: 3 },
+        subject: "zoyazor"
+      });
+      expect(parseRow("bot zoyazor got Wool", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "gain", player: "zoyazor", cards: { wool: 1 }, source: "other" },
+        subject: "zoyazor"
+      });
+      expect(parseRow("bot zoyazor gave bank Wool Wool Wool and took Grain", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "bankTrade", player: "zoyazor", gave: { wool: 3 }, got: { grain: 1 } },
+        subject: "zoyazor"
+      });
+      expect(parseRow("bot zoyazor built a City city ( +1 VP )", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "build", player: "zoyazor", piece: "city", setup: false },
+        subject: "zoyazor"
+      });
+      expect(parseRow("bot cecegran used Knight Knight", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "devPlay", player: "cecegran", card: "knight" },
+        subject: "cecegran"
+      });
+      expect(parseRow("bot cecegran moved Robber robber to prob_6 grain tile", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "robberMove", player: "cecegran" },
+        subject: "cecegran"
+      });
+      expect(parseRow("bot cecegran stole Lumber from you", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "steal", player: "cecegran", victim: "Megalovania", card: "lumber" },
+        subject: "cecegran"
+      });
+      expect(parseRow("bot BiBou8 bought Development Card", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "devBuy", player: "BiBou8" },
+        subject: "BiBou8"
       });
 
-      // Documented baseline bug (to be fixed in Step 2.4):
-      expect(parseRow("bot PlayfulGrid5655 built a road", 1, "Ashmaki").kind).toBe("unparsed");
-      expect(parseRow("bot PlayfulGrid5655 bought development card", 1, "Ashmaki").kind).toBe("unparsed");
-      expect(parseRow("bot PlayfulGrid5655 traded: 4 wool for 1 ore", 1, "Ashmaki").kind).toBe("unparsed");
+      // 2. trophy <Player> won the game! trophy
+      expect(normalizeRow("Player avatar trophy Megalovania won the game! trophy")).toBe("Megalovania won the game!");
+      expect(parseRow("Player avatar trophy Megalovania won the game! trophy", 20, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "gameEnd", winner: "Megalovania" },
+        subject: "Megalovania"
+      });
+      expect(parseRow("trophy AHeck won the game! trophy", 20, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "gameEnd", winner: "AHeck" },
+        subject: "AHeck"
+      });
+
+      // 3. Longest Road and Largest Army transfer messages
+      expect(
+        parseRow("Player avatar Longest Road longest road passed from Megalovania to Meyer1234 ( +2 VPs )", 15, "Megalovania")
+      ).toEqual({
+        kind: "event",
+        draft: { type: "longestRoad", player: "Meyer1234" },
+        subject: "Meyer1234"
+      });
+      expect(
+        parseRow("Player avatar Longest Road longest road passed from BiBou8 to you ( +2 VPs )", 15, "Megalovania")
+      ).toEqual({
+        kind: "event",
+        draft: { type: "longestRoad", player: "Megalovania" },
+        subject: "Megalovania"
+      });
+      expect(
+        parseRow("Player avatar Largest Army largest army passed from Megalovania to DaSheep420 ( +2 VPs )", 15, "Megalovania")
+      ).toEqual({
+        kind: "event",
+        draft: { type: "largestArmy", player: "DaSheep420" },
+        subject: "DaSheep420"
+      });
+
+      // 4. Rush-mode Dice rolled messages & Bot-thinking notices must not create phantom players
+      expect(parseRow("Player avatar Dice rolled dice_2 dice_3", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "roll", d1: 2, d2: 3, total: 5 },
+        subject: undefined
+      });
+      expect(parseRow("Dice rolled 7", 1, "Megalovania")).toEqual({
+        kind: "event",
+        draft: { type: "roll", total: 7 },
+        subject: undefined
+      });
+      expect(parseRow("Player avatar Bot is placing a road for Bailar9797", 0, "Megalovania")).toEqual({
+        kind: "ignored"
+      });
+      expect(parseRow("Player avatar Bot is selecting where to place Robber robber for Bailar9797", 5, "Megalovania")).toEqual({
+        kind: "ignored"
+      });
+
+      // Verify full Rush-mode recordings (path4053, hand179) and bot-takeover recordings (play277, steal1277, road5055)
+      for (const id of ["path4053", "hand179", "play277", "steal1277", "road5055"]) {
+        const rec = recordings.find((r) => r.id === id)!;
+        const parser = new LogParser(rec.meta.me);
+        for (const entry of rec.log) {
+          if (entry.text) parser.push(entry);
+        }
+        expect(parser.players.has("Dice")).toBe(false);
+        expect(parser.players.has("Bot")).toBe(false);
+        expect(parser.players.has("bot")).toBe(false);
+        expect(parser.players.has("trophy")).toBe(false);
+        expect(parser.players.has("Longest")).toBe(false);
+        expect(parser.players.has("Largest")).toBe(false);
+      }
+
+      // Specifically check road5055 and deck7708 end-to-end log parsing for bot actions, road transfer, and gameEnd
+      const deck = recordings.find((r) => r.id === "deck7708")!;
+      const deckParser = new LogParser(deck.meta.me);
+      for (const entry of deck.log) {
+        if (entry.text) deckParser.push(entry);
+      }
+      expect(deckParser.events.filter((e) => e.type === "longestRoad")).toEqual([
+        expect.objectContaining({ type: "longestRoad", player: "Megalovania" }),
+        expect.objectContaining({ type: "longestRoad", player: "Meyer1234" })
+      ]);
+      expect(deckParser.events.at(-1)).toMatchObject({ type: "gameEnd", winner: "Megalovania" });
+    });
+
+    it("[REGRESSION — Step 2.4] preserves existing log-row parsing semantics across standard human actions, chat, and noise rows", () => {
+      const parser = new LogParser("Megalovania");
+
+      // Setup builds (rolls === 0 -> setup: true)
+      expect(parser.push({ t: 1, text: "Player avatar You placed a Settlement settlement" })).toEqual({
+        kind: "event",
+        event: { type: "build", player: "Megalovania", piece: "settlement", setup: true, t: 1, turn: 0 }
+      });
+      expect(parser.push({ t: 2, text: "Player avatar You placed a Road road" })).toEqual({
+        kind: "event",
+        event: { type: "build", player: "Megalovania", piece: "road", setup: true, t: 2, turn: 0 }
+      });
+
+      // Roll + roll-attributed resource gain
+      expect(parser.push({ t: 3, text: "Player avatar AHeck rolled dice_3 dice_5" })).toEqual({
+        kind: "event",
+        event: { type: "roll", player: "AHeck", d1: 3, d2: 5, total: 8, t: 3, turn: 1 }
+      });
+      expect(parser.push({ t: 4, text: "Player avatar You got Ore Grain" })).toEqual({
+        kind: "event",
+        event: { type: "gain", player: "Megalovania", cards: { ore: 1, grain: 1 }, source: "roll", t: 4, turn: 1 }
+      });
+
+      // Road Building + 2 free roads
+      expect(parser.push({ t: 5, text: "Player avatar AHeck used Road Building" })).toEqual({
+        kind: "event",
+        event: { type: "devPlay", player: "AHeck", card: "roadBuilding", t: 5, turn: 1 }
+      });
+      expect(parser.push({ t: 6, text: "Player avatar AHeck built a Road road" })).toEqual({
+        kind: "event",
+        event: { type: "build", player: "AHeck", piece: "road", setup: false, free: true, t: 6, turn: 1 }
+      });
+      expect(parser.push({ t: 7, text: "Player avatar AHeck built a Road road" })).toEqual({
+        kind: "event",
+        event: { type: "build", player: "AHeck", piece: "road", setup: false, free: true, t: 7, turn: 1 }
+      });
+      expect(parser.push({ t: 8, text: "Player avatar AHeck built a Road road" })).toEqual({
+        kind: "event",
+        event: { type: "build", player: "AHeck", piece: "road", setup: false, t: 8, turn: 1 }
+      });
+
+      // Monopoly, Year of Plenty (non-roll gain), player trade, discard, initial award claims
+      expect(parser.push({ t: 9, text: "Player avatar You used Monopoly and stole 3 Ore" })).toEqual({
+        kind: "event",
+        event: { type: "devPlay", player: "Megalovania", card: "monopoly", t: 9, turn: 1 }
+      });
+      expect(parser.push({ t: 10, text: "Player avatar You stole 3 Ore" })).toEqual({
+        kind: "event",
+        event: { type: "monopoly", player: "Megalovania", cards: { ore: 3 }, t: 10, turn: 1 }
+      });
+      expect(parser.push({ t: 11, text: "Player avatar You took from bank Lumber Brick" })).toEqual({
+        kind: "event",
+        event: { type: "gain", player: "Megalovania", cards: { lumber: 1, brick: 1 }, source: "other", t: 11, turn: 1 }
+      });
+      expect(parser.push({ t: 12, text: "Player avatar You traded Wool for Grain with AHeck" })).toEqual({
+        kind: "event",
+        event: { type: "trade", player: "Megalovania", partner: "AHeck", gave: { wool: 1 }, got: { grain: 1 }, t: 12, turn: 1 }
+      });
+      expect(parser.push({ t: 13, text: "Player avatar AHeck discarded Wool Wool Lumber" })).toEqual({
+        kind: "event",
+        event: { type: "discard", player: "AHeck", cards: { wool: 2, lumber: 1 }, t: 13, turn: 1 }
+      });
+      expect(parser.push({ t: 14, text: "Player avatar AHeck received Longest Road longest road ( +2 VPs )" })).toEqual({
+        kind: "event",
+        event: { type: "longestRoad", player: "AHeck", t: 14, turn: 1 }
+      });
+      expect(parser.push({ t: 15, text: "Player avatar You received Largest Army largest army ( +2 VPs )" })).toEqual({
+        kind: "event",
+        event: { type: "largestArmy", player: "Megalovania", t: 15, turn: 1 }
+      });
+
+      // Chat and noise rows remain ignored
+      expect(parser.push({ t: 16, text: "AHeck: gg wp" })).toEqual({ kind: "ignored" });
+      expect(parser.push({ t: 17, text: "bot AHeck has left the game" })).toEqual({ kind: "ignored" });
+      expect([...parser.players.keys()]).toEqual(["Megalovania", "AHeck"]);
     });
   });
+});
+
+describe("Stage 2 — Pending Step 2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
+  const recordings = loadRecordings();
 
   describe("8. [ACCEPTANCE] Robber Rules & Award Transfer Thresholds", () => {
     const farm = recordings.find((r) => r.id === "farm9373")!;

@@ -55,10 +55,11 @@ const STAGE_2_MODIFIED_MODULES = new Set([
   "// src/analyzer/snapshot.ts",
   "// src/analyzer/adapters/stateDiff.ts",
   "// src/analyzer/engine/decide.ts",
-  "// src/analyzer/engine/roads.ts"
+  "// src/analyzer/engine/roads.ts",
+  "// src/analyzer/adapters/logText.ts"
 ]);
 
-describe("Stage 1 & Steps 2.1–2.3 — Baseline Bundle & Runtime Parity", () => {
+describe("Stage 1 & Steps 2.1–2.4 — Baseline Bundle & Runtime Parity", () => {
   it("produces byte-identical bundles for inject.js, background.js, and popup/popup.js and preserves root baseline files", () => {
     for (const rel of ["inject.js", "background.js", "popup/popup.js"]) {
       const base = normalizeBundle(readFileSync(resolve(ROOT, rel), "utf8"));
@@ -67,7 +68,7 @@ describe("Stage 1 & Steps 2.1–2.3 — Baseline Bundle & Runtime Parity", () =>
     }
   });
 
-  it("preserves identical module order (all 34 src/ modules) and 100% AST/token parity on all 30 untouched modules in dist/firefox/content.js", () => {
+  it("preserves identical module order (all 34 src/ modules) and 100% AST/token parity on all 29 untouched modules in dist/firefox/content.js", () => {
     const base = normalizeBundle(readFileSync(resolve(ROOT, "content.js"), "utf8"));
     const built = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
     const baseHeaders = base.split("\n").filter((l) => l.startsWith("  // src/"));
@@ -92,7 +93,7 @@ describe("Stage 1 & Steps 2.1–2.3 — Baseline Bundle & Runtime Parity", () =>
     }
   });
 
-  it("verifies dist/firefox/content.js embeds Steps 2.1–2.3 fixes, wires them into helper.ts, and remains strictly advisory-only", () => {
+  it("verifies dist/firefox/content.js embeds Steps 2.1–2.4 fixes, wires them into helper.ts, and remains strictly advisory-only", () => {
     const builtContent = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
     const builtInject = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/inject.js"), "utf8"));
     const builtMods = splitModules(builtContent);
@@ -113,6 +114,13 @@ describe("Stage 1 & Steps 2.1–2.3 — Baseline Bundle & Runtime Parity", () =>
     expect(roadsMod).toContain("usedEdges");
     expect(roadsMod).toContain("if (net.blocked.has(root)) continue;");
     expect(roadsMod).not.toContain("if (net.blocked.has(next.to)");
+
+    // Step 2.4 present in dist/firefox/content.js
+    const logTextMod = builtMods.get("// src/analyzer/adapters/logText.ts")!;
+    expect(logTextMod).toContain("LEADING_ICON_PREFIX");
+    expect(logTextMod).toContain("TRAILING_ICON_SUFFIX");
+    expect(logTextMod).toContain("passed|transferred");
+    expect(logTextMod).toContain("/^dice$/i.test(m[1])");
 
     // Live extension helper.ts calls adviseRoad, listOpenEdges, bestEdge, and planTurn
     const helperMod = builtMods.get("// src/extension/helper.ts")!;

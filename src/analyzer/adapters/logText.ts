@@ -39,12 +39,22 @@ export function cardFrom(text: string): DevCardKind | undefined {
   return CARD_NAMES.find(([re]) => re.test(text))?.[1];
 }
 
+const LEADING_ICON_PREFIX = /^(?:(?:bot(?!\s+is\b)|trophy|player|icon[_a-z0-9-]*)\s+)+/i;
+const TRAILING_ICON_SUFFIX = /(?:\s+trophy)+$/i;
+
 export function normalizeRow(text: string): string {
-  return text.replace(/[\p{Extended_Pictographic}\u200d\ufe0f]/gu, " ").replace(/\bPlayer avatar\b/gi, " ").replace(/\s+/g, " ").trim();
+  return text
+    .replace(/[\p{Extended_Pictographic}\u200d\ufe0f]/gu, " ")
+    .replace(/\bPlayer avatar\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(LEADING_ICON_PREFIX, "")
+    .replace(TRAILING_ICON_SUFFIX, "")
+    .trim();
 }
 
 const VIEWER = "You";
-const NOISE = /\b(is blocked by the Robber|wants to give|proposed counter offer|Learn how to play|will take over|has disconnected|has reconnected)\b|\b(has left|have left|left the (game|room)|has joined|joined the (game|room)|disconnected|reconnected|rejoined|was kicked|votes?|spectat|is now ready|game (is )?starting)\b/i;
+const NOISE = /\b(is blocked by the Robber|wants to give|proposed counter offer|Learn how to play|will take over|has disconnected|has reconnected|Bot is (?:placing|selecting))\b|\b(has left|have left|left the (game|room)|has joined|joined the (game|room)|disconnected|reconnected|rejoined|was kicked|votes?|spectat|is now ready|game (is )?starting)\b/i;
 const CHAT = /^\S+:\s/;
 const you = (name: string, me?: string) => (name && /^you$/i.test(name) ? me ?? VIEWER : name);
 
@@ -54,7 +64,9 @@ export type RowParseResult =
   | { kind: "unparsed" }
   | { kind: "event"; draft: GameEventDraft; subject?: string };
 
-export function parseRow(text: string, rolls: number, me?: string): RowParseResult {
+export function parseRow(rawText: string, rolls: number, me?: string): RowParseResult {
+  const text = normalizeRow(rawText);
+  if (!text) return { kind: "ignored" };
   let m: RegExpExecArray | null;
   const event = (draft: GameEventDraft, subject?: string): RowParseResult => ({ kind: "event", draft, subject });
   const who = (name: string) => you(name, me);
@@ -62,10 +74,12 @@ export function parseRow(text: string, rolls: number, me?: string): RowParseResu
   if ((m = /^(\S+) rolled\b.*?dice[_ ]?([1-6])\D+dice[_ ]?([1-6])/i.exec(text))) {
     const d1 = Number(m[2]);
     const d2 = Number(m[3]);
-    return event({ type: "roll", player: who(m[1]), d1, d2, total: d1 + d2 }, who(m[1]));
+    const actor = /^dice$/i.test(m[1]) ? undefined : who(m[1]);
+    return event({ type: "roll", ...(actor ? { player: actor } : {}), d1, d2, total: d1 + d2 }, actor);
   }
   if ((m = /^(\S+) rolled\b\D{0,12}(\d{1,2})\b/i.exec(text)) && Number(m[2]) >= 2 && Number(m[2]) <= 12) {
-    return event({ type: "roll", player: who(m[1]), total: Number(m[2]) }, who(m[1]));
+    const actor = /^dice$/i.test(m[1]) ? undefined : who(m[1]);
+    return event({ type: "roll", ...(actor ? { player: actor } : {}), total: Number(m[2]) }, actor);
   }
   if ((m = /^(\S+) (?:placed|built)\b.*?\b(road|settlement|city)\b/i.exec(text))) {
     return event({ type: "build", player: who(m[1]), piece: m[2].toLowerCase() as PieceKind, setup: rolls === 0 }, who(m[1]));
@@ -99,10 +113,16 @@ export function parseRow(text: string, rolls: number, me?: string): RowParseResu
   if ((m = /^(\S+) discarded\b(.*)$/i.exec(text))) {
     return event({ type: "discard", player: who(m[1]), cards: resourceCards(m[2]) }, who(m[1]));
   }
-  if ((m = /^(\S+) .*\blongest road\b/i.exec(text)) && /received|took|got|has|claimed|gained/i.test(text)) {
+  if ((m = /\blongest road\b.*?\b(?:passed|transferred)\b.*?\bto (\S+)/i.exec(text))) {
     return event({ type: "longestRoad", player: who(m[1]) }, who(m[1]));
   }
-  if ((m = /^(\S+) .*\blargest army\b/i.exec(text)) && /received|took|got|has|claimed|gained/i.test(text)) {
+  if ((m = /\blargest army\b.*?\b(?:passed|transferred)\b.*?\bto (\S+)/i.exec(text))) {
+    return event({ type: "largestArmy", player: who(m[1]) }, who(m[1]));
+  }
+  if ((m = /^(\S+) .*\blongest road\b/i.exec(text)) && !/^(?:longest|largest)\b/i.test(m[1]) && /\b(?:received|took|got|has|claimed|gained)\b/i.test(text)) {
+    return event({ type: "longestRoad", player: who(m[1]) }, who(m[1]));
+  }
+  if ((m = /^(\S+) .*\blargest army\b/i.exec(text)) && !/^(?:longest|largest)\b/i.test(m[1]) && /\b(?:received|took|got|has|claimed|gained)\b/i.test(text)) {
     return event({ type: "largestArmy", player: who(m[1]) }, who(m[1]));
   }
   if ((m = /^(\S+) won the game/i.exec(text))) {
