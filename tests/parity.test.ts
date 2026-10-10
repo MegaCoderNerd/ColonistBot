@@ -13,6 +13,7 @@ import { coachedOpening } from "../src/analyzer/engine/opening";
 import { planMidgame } from "../src/analyzer/strategy";
 import { planTurn } from "../src/analyzer/engine/decide";
 import { networkLength } from "../src/analyzer/engine/roads";
+import { createHelper } from "../src/extension/helper";
 import type { Recording } from "../src/shared/schema";
 
 const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08.json";
@@ -57,8 +58,8 @@ const STAGE_2_MODIFIED_MODULES = new Set([
   "// src/analyzer/engine/roads.ts"
 ]);
 
-describe("Stage 1 & Steps 2.1–2.2 — Baseline Bundle & Runtime Parity", () => {
-  it("produces byte-identical bundles for inject.js, background.js, and popup/popup.js", () => {
+describe("Stage 1 & Steps 2.1–2.3 — Baseline Bundle & Runtime Parity", () => {
+  it("produces byte-identical bundles for inject.js, background.js, and popup/popup.js and preserves root baseline files", () => {
     for (const rel of ["inject.js", "background.js", "popup/popup.js"]) {
       const base = normalizeBundle(readFileSync(resolve(ROOT, rel), "utf8"));
       const built = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox", rel), "utf8"));
@@ -89,6 +90,64 @@ describe("Stage 1 & Steps 2.1–2.2 — Baseline Bundle & Runtime Parity", () =>
       const minBuilt = transformSync(builtCode!, { minifyWhitespace: true }).code;
       expect(minBuilt, `AST/token mismatch in untouched module ${header}`).toBe(minBase);
     }
+  });
+
+  it("verifies dist/firefox/content.js embeds Steps 2.1–2.3 fixes, wires them into helper.ts, and remains strictly advisory-only", () => {
+    const builtContent = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
+    const builtInject = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/inject.js"), "utf8"));
+    const builtMods = splitModules(builtContent);
+
+    // Step 2.1 present in dist/firefox/content.js
+    const stateDiffMod = builtMods.get("// src/analyzer/adapters/stateDiff.ts")!;
+    expect(stateDiffMod).toContain("VP_CATEGORY_WEIGHT");
+    expect(stateDiffMod).toContain("breakdownVp");
+    expect(stateDiffMod).not.toContain('10: "victoryPoint"');
+    expect(stateDiffMod).toContain("readGameSettings");
+
+    const decideMod = builtMods.get("// src/analyzer/engine/decide.ts")!;
+    expect(decideMod).toContain("playableCardsOf");
+
+    // Step 2.2 & Step 2.3 present in dist/firefox/content.js
+    const roadsMod = builtMods.get("// src/analyzer/engine/roads.ts")!;
+    expect(roadsMod).toContain("longestRoad(graph, blocked)");
+    expect(roadsMod).toContain("usedEdges");
+    expect(roadsMod).toContain("if (net.blocked.has(root)) continue;");
+    expect(roadsMod).not.toContain("if (net.blocked.has(next.to)");
+
+    // Live extension helper.ts calls adviseRoad, listOpenEdges, bestEdge, and planTurn
+    const helperMod = builtMods.get("// src/extension/helper.ts")!;
+    expect(helperMod).toContain("adviseRoad(");
+    expect(helperMod).toContain("listOpenEdges(");
+    expect(helperMod).toContain("bestEdge(");
+    expect(helperMod).toContain("planTurn(");
+
+    // Advisory-only check: content.js has zero WebSocket send calls, and inject.js only forwards nativeSend.call(this, data)
+    expect(builtContent).not.toContain(".send(");
+    const sendMatches = builtInject.match(/\.send\b/g) ?? [];
+    expect(sendMatches.length).toBe(2); // const nativeSend = ws.send; ws.send = function patchedSend...
+
+    // Live helper.feed + helper.view end-to-end check on farm9373
+    const recordings = loadRecordings();
+    const farm = recordings.find((r) => r.id === "farm9373")!;
+    const helper = createHelper();
+    for (const f of farm.frames) {
+      helper.feed(f);
+    }
+    const view = helper.view(
+      [],
+      {
+        meName: "Megalovania",
+        logNames: ["Megalovania", "Carson2570"],
+        rolls: 75,
+        firstPlacedAt: () => undefined,
+        loggedSettlements: () => 1,
+        hook: { sockets: 1, frames: farm.frames.length }
+      },
+      Date.now() + 5000
+    );
+    expect(view.lines[0]).toBe("Advising: Megalovania.");
+    expect(view.coach).toBeDefined();
+    expect(view.mapSvg).toContain("<svg");
   });
 
   it("reproduces identical decoded frame stats, state-diff events, snapshots, and coach decisions on captured 1v1 games", () => {

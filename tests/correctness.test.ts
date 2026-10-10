@@ -15,7 +15,7 @@ import {
 import { LogParser, parseRow } from "../src/analyzer/adapters/logText";
 import { placementsFrom, publicVp, robberTargets } from "../src/analyzer/advisor";
 import { contextFor, isLegal } from "../src/analyzer/strategy";
-import { buildNet, listOpenEdges, longestExtensions, longestRoad, networkLength } from "../src/analyzer/engine/roads";
+import { buildNet, listOpenEdges, longestExtensions, longestRoad, networkLength, adviseRoad } from "../src/analyzer/engine/roads";
 import { bagState } from "../src/analyzer/engine/value";
 import { planTurn, playableCardsOf, roadBattle } from "../src/analyzer/engine/decide";
 import type { Board, Placements } from "../src/analyzer/types";
@@ -28,31 +28,7 @@ function loadRecordings(): Recording[] {
   return raw.recordings;
 }
 
-/**
- * Reference acceptance specification for Step 2.3 (Legal open road edges:
- * may build INTO an opponent-occupied corner, but never branch OUT OF / THROUGH an opponent-occupied corner).
- */
-function computeAuthoritativeOpenEdges(
-  board: Board,
-  placements: Placements,
-  player: string
-): Array<{ edge: string; from: string; to: string }> {
-  const net = buildNet(board, placements, player);
-  if (!net) return [];
-  const roots = [...net.mine].filter((c) => !net.blocked.has(c));
-  const out: Array<{ edge: string; from: string; to: string }> = [];
-  const seen = new Set<string>();
-  for (const r of roots) {
-    for (const next of net.adj.get(r) ?? []) {
-      if (placements.roads.has(next.edge) || seen.has(next.edge)) continue;
-      seen.add(next.edge);
-      out.push({ edge: next.edge, from: r, to: next.to });
-    }
-  }
-  return out;
-}
-
-describe("Stage 2 — Acceptance Tests (Steps 2.1–2.2 Implemented)", () => {
+describe("Stage 2 — Acceptance Tests (Steps 2.1–2.3 Implemented)", () => {
   const recordings = loadRecordings();
 
   describe("1. [ACCEPTANCE — Step 2.1] Victory-Point Accounting & Visible vs. Confirmed Hidden VP", () => {
@@ -490,16 +466,80 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.2 Implemented)", () => {
       }
     });
   });
+
+  describe("6. [ACCEPTANCE — Step 2.3] Settlement Distance & Legal Road Placement", () => {
+    const farm = recordings.find((r) => r.id === "farm9373")!;
+    const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
+    const board: Board = parsed.board!;
+    const ctx = contextFor(board);
+
+    it("enforces the 2-edge settlement distance rule and never offers an already-occupied road edge", () => {
+      const c0 = ctx.corners[0];
+      const nbrs = ctx.nbrs.get(c0.at)!;
+      const occupied = new Set<string>([c0.at]);
+      expect(isLegal(ctx, c0.at, occupied)).toBe(false);
+      for (const n of nbrs) {
+        expect(isLegal(ctx, n, occupied)).toBe(false);
+      }
+
+      const net = buildNet(board, { settlements: new Map([[c0.at, "c1"]]), cities: new Map(), roads: new Map() }, "c1")!;
+      const firstEdge = net.adj.get(c0.at)![0];
+      const placementsWithRoad: Placements = {
+        settlements: new Map([[c0.at, "c1"]]),
+        cities: new Map(),
+        roads: new Map([[firstEdge.edge, "c1"]])
+      };
+      const open = listOpenEdges(board, placementsWithRoad, "c1");
+      expect(open.some((e) => e.edge === firstEdge.edge)).toBe(false);
+    });
+
+    it("allows building a road INTO an opponent-occupied corner, but prevents continuing THROUGH that corner", () => {
+      const c0 = ctx.corners[0];
+      const c1 = ctx.nbrs.get(c0.at)![0];
+      const c2 = ctx.nbrs.get(c1)!.find((x) => x !== c0.at)!;
+
+      // Case 1: c1 has a settlement at c0; opponent c2 has a settlement at adjacent corner c1.
+      const placementsIn: Placements = {
+        settlements: new Map([
+          [c0.at, "c1"],
+          [c1, "c2"]
+        ]),
+        cities: new Map(),
+        roads: new Map()
+      };
+      // c1 CAN build the road e1 (c0 -> c1) terminating at opponent corner c1
+      expect(listOpenEdges(board, placementsIn, "c1").some((e) => e.from === c0.at && e.to === c1)).toBe(true);
+
+      // Case 2: c1 already owns road e1 (c0 -> c1) and opponent c2 settles at c1.
+      const netInitial = buildNet(board, { settlements: new Map([[c0.at, "c1"]]), cities: new Map(), roads: new Map() }, "c1")!;
+      const e1 = netInitial.adj.get(c0.at)!.find((x) => x.to === c1)!.edge;
+      const placementsThrough: Placements = {
+        settlements: new Map([
+          [c0.at, "c1"],
+          [c1, "c2"]
+        ]),
+        cities: new Map(),
+        roads: new Map([[e1, "c1"]])
+      };
+      // c1 CANNOT branch out of opponent-occupied c1 to c2
+      expect(listOpenEdges(board, placementsThrough, "c1").some((e) => e.from === c1)).toBe(false);
+      expect(listOpenEdges(board, placementsThrough, "c1").some((e) => e.from === c1 && e.to === c2)).toBe(false);
+
+      // If c0 has no other open edges (or when advising from c1), adviseRoad never recommends an edge starting only from blocked c1
+      const adviceFromBlocked = adviseRoad(board, placementsThrough, "c1", { from: c1, onlyFrom: true });
+      expect(adviceFromBlocked).toBeUndefined();
+    });
+  });
 });
 
-describe("Stage 2 — Pending Steps 2.3–2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
+describe("Stage 2 — Pending Steps 2.4–2.5 (Acceptance Specifications & Documented Baseline Bugs)", () => {
   const recordings = loadRecordings();
 
-  describe("6. Dice Roll Extraction, Balanced Deck Cycle, and Pending Step 2.4 LogParser Bot-Prefix Bug", () => {
+  describe("7. Dice Roll Extraction, Balanced Deck Cycle, and Pending Step 2.4 LogParser Bot-Prefix Bug", () => {
     it("[ACCEPTANCE] verifies 100% roll sequence agreement between WebSocket diceState and LogParser (75 rolls in farm9373) and 36-card Balanced Dice cycle", () => {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const { decoded } = decodeFrames(farm.frames);
-      const stateParsed = stateDiffAdapter.parse(decoded);
+      const stateParsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const wsRolls = stateParsed.events.filter((e) => e.type === "roll");
 
       const logParser = new LogParser(farm.meta.me);
@@ -550,69 +590,6 @@ describe("Stage 2 — Pending Steps 2.3–2.5 (Acceptance Specifications & Docum
       expect(parseRow("bot PlayfulGrid5655 built a road", 1, "Ashmaki").kind).toBe("unparsed");
       expect(parseRow("bot PlayfulGrid5655 bought development card", 1, "Ashmaki").kind).toBe("unparsed");
       expect(parseRow("bot PlayfulGrid5655 traded: 4 wool for 1 ore", 1, "Ashmaki").kind).toBe("unparsed");
-    });
-  });
-
-  describe("7. [ACCEPTANCE & PENDING Step 2.3] Settlement Distance & Road Legality", () => {
-    const farm = recordings.find((r) => r.id === "farm9373")!;
-    const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
-    const board: Board = parsed.board!;
-    const ctx = contextFor(board);
-
-    it("[ACCEPTANCE] enforces the 2-edge settlement distance rule and never offers an already-occupied road edge", () => {
-      const c0 = ctx.corners[0];
-      const nbrs = ctx.nbrs.get(c0.at)!;
-      const occupied = new Set<string>([c0.at]);
-      expect(isLegal(ctx, c0.at, occupied)).toBe(false);
-      for (const n of nbrs) {
-        expect(isLegal(ctx, n, occupied)).toBe(false);
-      }
-
-      const net = buildNet(board, { settlements: new Map([[c0.at, "c1"]]), cities: new Map(), roads: new Map() }, "c1")!;
-      const firstEdge = net.adj.get(c0.at)![0];
-      const placementsWithRoad: Placements = {
-        settlements: new Map([[c0.at, "c1"]]),
-        cities: new Map(),
-        roads: new Map([[firstEdge.edge, "c1"]])
-      };
-      const open = listOpenEdges(board, placementsWithRoad, "c1");
-      expect(open.some((e) => e.edge === firstEdge.edge)).toBe(false);
-    });
-
-    it("[PENDING Step 2.3 — Acceptance Spec vs. Baseline Bug] allows building a road INTO an opponent-occupied corner, but prevents continuing THROUGH that corner", () => {
-      const c0 = ctx.corners[0];
-      const c1 = ctx.nbrs.get(c0.at)![0];
-      const c2 = ctx.nbrs.get(c1)!.find((x) => x !== c0.at)!;
-
-      // Case 1: c1 has a settlement at c0; opponent c2 has a settlement at adjacent corner c1.
-      const placementsIn: Placements = {
-        settlements: new Map([
-          [c0.at, "c1"],
-          [c1, "c2"]
-        ]),
-        cities: new Map(),
-        roads: new Map()
-      };
-      // Acceptance spec: c1 CAN build the road e1 (c0 -> c1) terminating at opponent corner c1
-      expect(computeAuthoritativeOpenEdges(board, placementsIn, "c1").some((e) => e.to === c1)).toBe(true);
-      // Documented baseline bug (to be fixed in Step 2.3): listOpenEdges blocks building into c1
-      expect(listOpenEdges(board, placementsIn, "c1").some((e) => e.to === c1)).toBe(false);
-
-      // Case 2: c1 already owns road e1 (c0 -> c1) and opponent c2 settles at c1.
-      const netInitial = buildNet(board, { settlements: new Map([[c0.at, "c1"]]), cities: new Map(), roads: new Map() }, "c1")!;
-      const e1 = netInitial.adj.get(c0.at)!.find((x) => x.to === c1)!.edge;
-      const placementsThrough: Placements = {
-        settlements: new Map([
-          [c0.at, "c1"],
-          [c1, "c2"]
-        ]),
-        cities: new Map(),
-        roads: new Map([[e1, "c1"]])
-      };
-      // Acceptance spec: c1 CANNOT branch out of opponent-occupied c1 to c2
-      expect(computeAuthoritativeOpenEdges(board, placementsThrough, "c1").some((e) => e.from === c1 && e.to === c2)).toBe(false);
-      // Documented baseline bug (to be fixed in Step 2.3): listOpenEdges allows branching through c1 to c2
-      expect(listOpenEdges(board, placementsThrough, "c1").some((e) => e.from === c1 && e.to === c2)).toBe(true);
     });
   });
 

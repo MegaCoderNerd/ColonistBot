@@ -133,8 +133,9 @@ export function listOpenEdges(
   const out: Array<{ edge: string; from: string; to: string }> = [];
   const seen = new Set<string>();
   for (const root of roots) {
+    if (net.blocked.has(root)) continue;
     for (const next of net.adj.get(root) ?? []) {
-      if (net.blocked.has(next.to) || net.graph.get(root)?.has(next.to) || seen.has(next.edge)) continue;
+      if (net.graph.get(root)?.has(next.to) || seen.has(next.edge)) continue;
       seen.add(next.edge);
       out.push({ edge: next.edge, from: root, to: next.to });
     }
@@ -155,7 +156,7 @@ export function longestExtensions(board: Board, placements: Placements, me: stri
   for (const end of chain.ends) {
     if (!net.mine.has(end) || net.blocked.has(end)) continue;
     for (const next of net.adj.get(end) ?? []) {
-      if (net.blocked.has(next.to) || net.graph.get(end)?.has(next.to) || seen.has(next.edge)) continue;
+      if (net.graph.get(end)?.has(next.to) || seen.has(next.edge)) continue;
       seen.add(next.edge);
       out.push({ edge: next.edge, to: next.to });
     }
@@ -256,7 +257,7 @@ export function adviseRoad(
     for (const end of chain.ends) {
       if (blocked.has(end)) continue;
       for (const next of adj.get(end) ?? []) {
-        if (blocked.has(next.to) || graph.get(end)?.has(next.to)) continue;
+        if (graph.get(end)?.has(next.to)) continue;
         if (!mine.has(end)) continue;
         const score = 11;
         if (!best || score > best.score) {
@@ -272,7 +273,8 @@ export function adviseRoad(
   }
   if (!best) return undefined;
   const touch = endsOf(ctx, best.step.edge);
-  if (!touch || (!mine.has(touch[0]) && !mine.has(touch[1]))) return undefined;
+  const canStart = (c: string) => mine.has(c) && !blocked.has(c);
+  if (!touch || (!canStart(touch[0]) && !canStart(touch[1]))) return undefined;
   return { edge: best.step.edge, toward: best.toward, reason: best.reason };
 }
 
