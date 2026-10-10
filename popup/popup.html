@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>Colonist Recorder</title>
+  </head>
+  <body>
+    <header>
+      <h1>Colonist Recorder</h1>
+      <p id="status" class="status">Checking tab...</p>
+      <button id="grant" class="primary" hidden>Allow access to colonist.io</button>
+    </header>
+    <section class="row">
+      <label class="toggle"><input type="checkbox" id="force" /> Record even without a game id</label>
+    </section>
+    <section class="row">
+      <label class="toggle"><input type="checkbox" id="overlay" /> Show the card counter on colonist.io</label>
+    </section>
+    <section class="row">
+      <label class="toggle"><input type="checkbox" id="ws" /> Record network (WebSocket) data for the board</label>
+    </section>
+    <section class="row">
+      <label class="toggle"><input type="checkbox" id="helper" /> Placement and build hints, reads network data (off by default)</label>
+    </section>
+    <section class="row">
+      <span id="shots-status">Screenshots of the board and end screen need an extra permission.</span>
+      <button id="shots-grant" hidden>Allow screenshots</button>
+    </section>
+    <section class="row">
+      <label for="me">Your username</label>
+      <input id="me" type="text" placeholder="Megalovania" />
+    </section>
+    <section>
+      <h2>Recordings <span id="count"></span></h2>
+      <ul id="list" class="list"></ul>
+      <p id="empty" class="empty" hidden>Nothing recorded yet. Open a Colonist game and play, or open a replay.</p>
+    </section>
+    <footer>
+      <button id="export-all">Export all</button>
+      <button id="dashboard" class="primary">Open dashboard</button>
+    </footer>
+    <script src="popup.js"></script>
+  </body>
+</html>
