@@ -973,18 +973,77 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
       expect(buyDev(p, () => 23 / 25)).toBe("monopoly");
       expect(buyDev(p, () => 24.9 / 25)).toBe("monopoly");
 
-      // Monopoly alone in readyDevs is preserved as "monopoly" and never resolved as Year of Plenty
-      const monoHolder = newPlayer({ vp: 2, readyDevs: ["monopoly"] });
-      expect(playDev(monoHolder, opp, () => 0)).toBe(false);
-      expect(monoHolder.playedDevThisTurn).toBe(false);
-      expect(monoHolder.readyDevs).toEqual(["monopoly"]);
-      expect(Object.values(monoHolder.hand).reduce((a, b) => a + b, 0)).toBe(0);
+      // 1. Purchased Monopoly via act() remains in boughtDevs (unavailable in readyDevs) until endTurn
+      const monoBuyer = newPlayer({
+        vp: 2,
+        hand: { lumber: 0, brick: 0, wool: 1, grain: 1, ore: 1 }
+      });
+      // rng = 24/25 draws Monopoly (>= 23/25)
+      act(monoBuyer, opp, () => 24 / 25);
+      expect(monoBuyer.devs).toBe(1);
+      expect(monoBuyer.boughtDevs).toEqual(["monopoly"]);
+      expect(monoBuyer.readyDevs).toEqual([]);
+      expect(monoBuyer.playedDevThisTurn).toBe(false);
+      expect(Object.values(monoBuyer.hand).reduce((a, b) => a + b, 0)).toBe(0);
 
-      // When Monopoly precedes a Knight in readyDevs, playDev skips Monopoly (preserving it) and plays the Knight
-      const mixedHolder = newPlayer({ vp: 2, readyDevs: ["monopoly", "knight"] });
-      expect(playDev(mixedHolder, opp, () => 0)).toBe(true);
-      expect(mixedHolder.knights).toBe(1);
-      expect(mixedHolder.readyDevs).toEqual(["monopoly"]);
+      // 2 & 3 & 4. On the next turn after endTurn, Monopoly moves to readyDevs, is NOT silently removed or marked as played by playDev() or recursive act(), and never fabricates 2 resources as Year of Plenty
+      endTurn(monoBuyer);
+      expect(monoBuyer.boughtDevs).toEqual([]);
+      expect(monoBuyer.readyDevs).toEqual(["monopoly"]);
+      expect(playDev(monoBuyer, opp, () => 0)).toBe(false);
+      expect(monoBuyer.playedDevThisTurn).toBe(false);
+      expect(monoBuyer.readyDevs).toEqual(["monopoly"]);
+      expect(Object.values(monoBuyer.hand).reduce((a, b) => a + b, 0)).toBe(0);
+
+      // Even when monoBuyer builds a road during act() on Turn 2 (triggering recursive act()), Monopoly stays untouched in readyDevs and playedDevThisTurn stays false
+      monoBuyer.hand = { lumber: 1, brick: 1, wool: 0, grain: 0, ore: 0 };
+      monoBuyer.expansions = [{ prods: [], pip: 8, roads: 2 }];
+      act(monoBuyer, opp, () => 0);
+      expect(monoBuyer.progress).toBe(1);
+      expect(monoBuyer.playedDevThisTurn).toBe(false);
+      expect(monoBuyer.readyDevs).toEqual(["monopoly"]);
+      expect(Object.values(monoBuyer.hand).reduce((a, b) => a + b, 0)).toBe(0);
+
+      // 5. Supported action cards (Knight, Road Building, Year of Plenty) retain same-turn purchase lock and 1-card-per-turn play limit alongside preserved Monopoly
+      const allCards = newPlayer({
+        vp: 2,
+        readyDevs: ["monopoly"]
+      });
+      // Buy Knight, Road Building, and Year of Plenty on the same turn -> all 3 sit in boughtDevs and cannot be played this turn
+      expect(buyDev(allCards, () => 0 / 25)).toBe("knight");
+      expect(buyDev(allCards, () => 20 / 25)).toBe("roadBuilding");
+      expect(buyDev(allCards, () => 22 / 25)).toBe("yearOfPlenty");
+      expect(allCards.boughtDevs).toEqual(["knight", "roadBuilding", "yearOfPlenty"]);
+      expect(allCards.readyDevs).toEqual(["monopoly"]);
+      expect(playDev(allCards, opp, () => 0)).toBe(false);
+      expect(allCards.playedDevThisTurn).toBe(false);
+
+      // End turn -> all 3 supported cards join readyDevs behind Monopoly
+      endTurn(allCards);
+      expect(allCards.readyDevs).toEqual(["monopoly", "knight", "roadBuilding", "yearOfPlenty"]);
+
+      // Turn A: skips Monopoly (preserving it), plays Knight (1 per turn), blocks Road Building & Year of Plenty this turn
+      act(allCards, opp, () => 0);
+      expect(allCards.playedDevThisTurn).toBe(true);
+      expect(allCards.knights).toBe(1);
+      expect(allCards.progress).toBe(0);
+      expect(Object.values(allCards.hand).reduce((a, b) => a + b, 0)).toBe(0);
+      expect(allCards.readyDevs).toEqual(["monopoly", "roadBuilding", "yearOfPlenty"]);
+      endTurn(allCards);
+
+      // Turn B: skips Monopoly (preserving it), plays Road Building (1 per turn), blocks Year of Plenty this turn
+      act(allCards, opp, () => 0);
+      expect(allCards.playedDevThisTurn).toBe(true);
+      expect(allCards.progress).toBe(2);
+      expect(Object.values(allCards.hand).reduce((a, b) => a + b, 0)).toBe(0);
+      expect(allCards.readyDevs).toEqual(["monopoly", "yearOfPlenty"]);
+      endTurn(allCards);
+
+      // Turn C: skips Monopoly (preserving it), plays Year of Plenty (+2 resources), leaves Monopoly intact
+      act(allCards, opp, () => 0);
+      expect(allCards.playedDevThisTurn).toBe(true);
+      expect(Object.values(allCards.hand).reduce((a, b) => a + b, 0)).toBe(2);
+      expect(allCards.readyDevs).toEqual(["monopoly"]);
     });
   });
 });
