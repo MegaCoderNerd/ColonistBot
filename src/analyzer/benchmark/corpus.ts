@@ -19,7 +19,7 @@ import { stateDiffAdapter } from "../adapters/stateDiff";
 import { placementsFrom } from "../advisor";
 import { buildObservedGameState } from "../engine/state";
 import type { ObservedGameState } from "../engine/state";
-import { materializeConcreteState } from "../engine/transition";
+import { getLegalActions, materializeConcreteState } from "../engine/transition";
 import { createSeededRng } from "../engine/rng";
 import { sampleDeterminization } from "../engine/determinize";
 import type { DeterminizationResult } from "../engine/determinize";
@@ -278,6 +278,13 @@ export function buildRecordingCorpus(
       const concrete = cloneConcreteState(materialized.state);
       // Ensure VP fields are consistent with the board before feature extraction.
       recomputePlayerVp(concrete);
+      // A recording frame can expose a transient/inconsistent phase snapshot (for example,
+      // `main` with dice.thrown=false). Such a state is not simulatable and must not enter the
+      // policy corpus as a zero-action position.
+      if (getLegalActions(concrete, selfId).length === 0) {
+        positionsSkipped += 1;
+        continue;
+      }
 
       const position = positionFromConcreteState({
         positionId: `${recording.id}@${frameLimit}`,
@@ -350,4 +357,3 @@ export function hasFullStratumCoverage(
   const missing = strata.filter((s) => !present.has(s));
   return { covered: missing.length === 0, missing };
 }
-

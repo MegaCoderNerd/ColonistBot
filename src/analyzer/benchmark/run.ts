@@ -82,6 +82,8 @@ const KNOWN_LIMITATIONS: readonly string[] = [
   "Paired difference testing (exact two-tailed McNemar) tests for evidence of difference across matched initial determinized worlds. A non-significant result (p >= alpha) indicates no clear difference detected, NOT equivalence; claiming equivalence would require a pre-specified equivalence margin.",
   "Overlapping Wilson intervals between the top two candidates are reported as an observation only. Overlap is not proof of equivalence and non-overlap is not a complete answer to all practical considerations.",
   "Empirical win rates and Wilson intervals strictly use completed games as the denominator; cutoffs and failures are recorded separately and are neither counted as wins nor losses.",
+  "Recording frames that materialize into a supported phase with no legal action are excluded from the simulatable corpus; these are transient or internally inconsistent snapshots, not policy losses.",
+  "The random legal-action policy is intentionally non-competitive: repeated bank trades, missed conversions, and long games that hit the horizon are expected diagnostic behaviour, not evidence of an engine defect.",
   "Tactical pass rates cover only rule-proven and constructed-scenario-proven cases. Positions with multiple valid choices or no established answer are reported as informational and never counted as failures.",
   "Balanced Dice models are provisional empirical approximations (isExact: false), not exact reproductions of proprietary Colonist server code. Colonist 1v1 per-player seven-streak balancing is not modeled.",
   "Positions from the same recording are grouped by recording ID and must never be split across evaluation folds; a recording is not an independent sample per frame.",

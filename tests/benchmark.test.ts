@@ -4,7 +4,7 @@ import { describe, it, expect } from "vitest";
 
 import { buildBoardTopology } from "../src/analyzer/engine/topology";
 import { buildObservedGameState } from "../src/analyzer/engine/state";
-import { baselineRolloutPolicy } from "../src/analyzer/engine/rollout";
+import { baselineRolloutPolicy, runRollout } from "../src/analyzer/engine/rollout";
 import { aggressiveDevRolloutPolicy } from "../src/analyzer/engine/policies";
 import { createSeededRng } from "../src/analyzer/engine/rng";
 import { getLegalActions } from "../src/analyzer/engine/transition";
@@ -27,7 +27,9 @@ import {
 
 import {
   buildObservedFromRecording,
+  buildRecordingCorpus,
 } from "../src/analyzer/benchmark/corpus";
+import { validateConcreteSimState } from "../src/analyzer/engine/state";
 
 type RecordingFixture =
   Parameters<typeof buildObservedFromRecording>[0] & {
@@ -229,6 +231,21 @@ describe("Stage 3.5 Benchmark Suite", () => {
     expect(unrelatedSelected.type).toBe("buyDevCard");
   });
 
+  it("baseline converts an established city opportunity before non-winning alternatives", () => {
+    const fixture = createFixtures().immediateWinByCity;
+    const legalActions = getLegalActions(fixture.concrete, fixture.selfId);
+    const selected = baselineRolloutPolicy.selectAction(
+      fixture.concrete,
+      fixture.selfId,
+      legalActions,
+      createSeededRng(7),
+      { stepIndex: 0, bankTradesThisTurn: 0 }
+    );
+
+    expect(legalActions.some((action) => action.type === "buildCity")).toBe(true);
+    expect(selected.type).toBe("buildCity");
+  });
+
   it("evaluatePolicyOnPosition returns accounting for a synthetic position", () => {
     const position = createFixtures().noImmediateWinAvailable;
 
@@ -255,9 +272,78 @@ describe("Stage 3.5 Benchmark Suite", () => {
       failed: expect.any(Number),
       cutoffMaxTurns: expect.any(Number),
       cutoffMaxActions: expect.any(Number),
+      terminationReasons: expect.any(Object),
     });
 
     expect(result.trialOutcomes).toHaveLength(2);
+    expect(Object.values(result.accounting.terminationReasons).reduce((sum, count) => sum + count, 0))
+      .toBe(result.accounting.sampleCount);
+  });
+
+  it("excludes recording positions with no legal action", () => {
+    if (recordings.length === 0) return;
+    const corpus = buildRecordingCorpus(recordings, {
+      sampleSeed: "stage-3.5-corpus",
+      frameFractions: [0.35, 0.6, 0.85, 1]
+    });
+    expect(corpus.positions.every((position) =>
+      position.features.legalActionCount > 0
+    )).toBe(true);
+    expect(corpus.coverage.positionsSkipped).toBeGreaterThanOrEqual(1);
+  });
+
+  it.skipIf(recordings.length === 0)("keeps long rollouts reproducible and invariant-valid", () => {
+    const position = buildRecordingCorpus(recordings, {
+      sampleSeed: "stage-3.5-corpus",
+      frameFractions: [0.35, 0.6, 0.85, 1]
+    }).positions[0]!;
+    expect(position).toBeDefined();
+    const options = {
+      policy: baselineRolloutPolicy,
+      maxTurns: 40,
+      maxActions: 300,
+      validateEveryStep: true,
+      separateDomainStreams: true
+    } as const;
+    const first = runRollout(position.concrete, createSeededRng(2468), options);
+    const second = runRollout(position.concrete, createSeededRng(2468), options);
+
+    expect(second.status).toBe(first.status);
+    expect(second.completed).toBe(first.completed);
+    expect(second.winnerId).toBe(first.winnerId);
+    expect(second.actionsSimulated).toBe(first.actionsSimulated);
+    expect(second.turnsSimulated).toBe(first.turnsSimulated);
+    expect(validateConcreteSimState(first.finalState).valid).toBe(true);
+    expect(validateConcreteSimState(second.finalState).valid).toBe(true);
+  });
+
+  it.skipIf(recordings.length === 0)("detects an already-terminal state without simulating another action", () => {
+    const position = buildRecordingCorpus(recordings, {
+      sampleSeed: "stage-3.5-corpus",
+      frameFractions: [0.35, 0.6, 0.85, 1]
+    }).positions[0]!;
+    expect(position).toBeDefined();
+    const terminalResult = runRollout(position.concrete, createSeededRng(1357), {
+      policy: baselineRolloutPolicy,
+      maxTurns: 120,
+      maxActions: 600,
+      validateEveryStep: true,
+      separateDomainStreams: true
+    });
+    expect(terminalResult.status).toBe("completed");
+    expect(terminalResult.completed).toBe(true);
+
+    const result = runRollout(terminalResult.finalState, createSeededRng(99), {
+      policy: baselineRolloutPolicy,
+      maxTurns: 1,
+      maxActions: 1,
+      validateEveryStep: true
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.completed).toBe(true);
+    expect(result.winnerId).toBe(terminalResult.winnerId);
+    expect(result.actionsSimulated).toBe(0);
   });
 
   it("paired comparison returns a valid classification for reproducible runs", () => {
