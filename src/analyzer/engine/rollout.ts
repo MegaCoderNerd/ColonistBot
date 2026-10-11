@@ -91,6 +91,13 @@ export interface RolloutOptions {
   readonly validateEveryStep?: boolean;
   /** Whether to record the full step-by-step action/outcome trace. Default: false. */
   readonly recordTrace?: boolean;
+  /**
+   * If true, decouples stochastic events into separate deterministic pseudorandom streams
+   * for dice rolls, robber victim thefts, and policy random selection, ensuring events in one
+   * domain (such as victim theft) do not advance or desynchronize dice roll sequences in another branch.
+   * Defaults to false in standalone rollouts for backwards compatibility; enabled in shadow evaluation.
+   */
+  readonly separateDomainStreams?: boolean;
 }
 
 export interface RolloutResult {
@@ -748,6 +755,17 @@ export function runRollout(
       });
 
   const diceModel = diceResolution.model;
+  const separateDomainStreams = options?.separateDomainStreams === true;
+  const diceRng = separateDomainStreams
+    ? createSeededRng(deriveTrialSeed(rng.initialSeed, 0, "rollout-dice"))
+    : rng;
+  const theftRng = separateDomainStreams
+    ? createSeededRng(deriveTrialSeed(rng.initialSeed, 0, "rollout-theft"))
+    : rng;
+  const policyRng = separateDomainStreams
+    ? createSeededRng(deriveTrialSeed(rng.initialSeed, 0, "rollout-policy"))
+    : rng;
+
   const baseResultFields = {
     initialSeed: rng.initialSeed,
     policyId: policy.id,
@@ -947,7 +965,7 @@ export function runRollout(
       };
     }
 
-    const chosenAction = policy.selectAction(state, actorId, legalActions, rng, {
+    const chosenAction = policy.selectAction(state, actorId, legalActions, policyRng, {
       stepIndex: actionsSimulated,
       bankTradesThisTurn
     });
@@ -970,7 +988,7 @@ export function runRollout(
     let outcome: ActionOutcome | undefined;
     if (chosenAction.type === "rollDice") {
       if (chosenAction.d1 === undefined && chosenAction.d2 === undefined && chosenAction.total === undefined) {
-        const sample = diceModel.sampleOutcome(rng, { rollHistory, alignmentStatus });
+        const sample = diceModel.sampleOutcome(diceRng, { rollHistory, alignmentStatus });
         if (!sample.ok || !sample.outcome) {
           return {
             ...baseResultFields,
@@ -997,7 +1015,7 @@ export function runRollout(
       const victim = state.players.find((p) => p.id === chosenAction.victimId);
       if (victim && sumHand(victim.hand) > 0) {
         const cardWeights = RESOURCES.map((r) => Math.max(0, victim.hand[r]));
-        const stolenRes = RESOURCES[rng.weightedIndex(cardWeights)];
+        const stolenRes = RESOURCES[theftRng.weightedIndex(cardWeights)];
         outcome = { stolenResource: stolenRes };
       }
     }

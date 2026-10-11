@@ -307,6 +307,13 @@ export interface WilsonConfidenceInterval {
   readonly standardError: number;
 }
 
+export type PairedComparisonClassification =
+  | "self_baseline"
+  | "evidence_favors_candidate"
+  | "evidence_favors_legacy"
+  | "no_clear_difference"
+  | "insufficient_data";
+
 export interface PairedComparisonSummary {
   readonly baselineCandidateId: string;
   readonly pairedCompletedTrials: number;
@@ -318,11 +325,14 @@ export interface PairedComparisonSummary {
   /** Empirical win-rate difference `(candidateWins - baselineWins) / pairedCompletedTrials` on shared completed trials. */
   readonly pairedWinRateDelta: number | null;
   readonly pairedDeltaStandardError: number | null;
-  readonly classification:
-    | "self_baseline"
-    | "agrees_with_legacy"
-    | "inconclusive_difference"
-    | "experimental_disagreement";
+  /** Exact two-tailed binomial p-value under H0: P(candWonBaseLost) = P(baseWonCandLost) = 0.5. */
+  readonly mcnemarPValue: number | null;
+  /** Significance threshold alpha used for difference testing (default: 0.05). */
+  readonly significanceAlpha: number;
+  /** Minimum completed trials required for each candidate to attempt statistical comparison (default: 10). */
+  readonly minCompletedTrialsRequired: number;
+  readonly classification: PairedComparisonClassification;
+  readonly explanation: string;
 }
 
 export interface CandidateShadowEvaluation {
@@ -331,6 +341,14 @@ export interface CandidateShadowEvaluation {
   readonly evaluationStatus: CandidateEvaluationStatus;
   readonly isSufficientlySupported: boolean;
   readonly statusReason: string;
+  /** Total rollout trials attempted for this specific candidate. */
+  readonly trialsAttempted: number;
+  /** Total trials that reached a completed game. */
+  readonly trialsCompleted: number;
+  /** Total trials that terminated early due to cutoff (max turns, max actions, budget exhausted). */
+  readonly trialsCutoff: number;
+  /** Total trials that failed due to determinization error, illegal candidate action, or runtime error. */
+  readonly trialsFailed: number;
   readonly determinizationAttempts: number;
   readonly determinizationSuccesses: number;
   readonly completedGames: number;
@@ -352,11 +370,20 @@ export interface CandidateShadowEvaluation {
     readonly illegalAction: number;
     readonly rolloutError: number;
   };
+  /**
+   * Exact denominator used for `empiricalWinRateAmongCompleted` and `wilson95Interval`.
+   * Equal to `completedGames`. Incomplete trials (cutoffs/failures) are never included in this denominator.
+   */
+  readonly winRateDenominator: number;
   /** Pure empirical win rate among completed trials (`wins / completedGames`), or `null` if `completedGames === 0`. */
   readonly empiricalWinRateAmongCompleted: number | null;
+  /** Conservative lower-bound win rate among all attempted trials (`wins / determinizationAttempts`), treating cutoffs and failures as non-wins. */
+  readonly conservativeWinRateAllAttempts: number | null;
   /** Fraction of attempted determinizations that reached a completed game (`completedGames / determinizationAttempts`). */
   readonly completionRate: number;
   readonly wilson95Interval: WilsonConfidenceInterval | null;
+  /** Explicit descriptor of interval formula and denominator. */
+  readonly intervalDefinition: string;
   /**
    * Separate non-empirical diagnostic metric: average simulated VP margin `(selfActualVp - bestOppActualVp)`
    * at cutoff across incomplete cutoff trials only. Never blended into `wins` or `empiricalWinRateAmongCompleted`.
@@ -386,12 +413,64 @@ export interface ShadowBudgetDiagnostics {
   readonly candidatesSkippedByCap: number;
   readonly determinizationsAttempted: number;
   readonly determinizationsSucceeded: number;
+  /** Total rollouts attempted across all candidates combined. */
+  readonly totalRolloutsAttempted: number;
+  /** Total rollouts completed across all candidates combined. */
+  readonly totalRolloutsCompleted: number;
+  /** Total rollouts cut off across all candidates combined. */
+  readonly totalRolloutsCutoff: number;
+  /** Total rollouts failed across all candidates combined. */
+  readonly totalRolloutsFailed: number;
   readonly totalRolloutsExecuted: number;
   readonly totalSimulatedActions: number;
   readonly stoppedByElapsedBudget: boolean;
   readonly stoppedByRolloutCap: boolean;
   readonly stoppedByActionCap: boolean;
   readonly stoppedByStaleCallback: boolean;
+}
+
+export interface SampleAccountingSummary {
+  readonly totalRolloutsAttempted: number;
+  readonly totalRolloutsCompleted: number;
+  readonly totalRolloutsCutoff: number;
+  readonly totalRolloutsFailed: number;
+  readonly candidatesEvaluatedCount: number;
+  readonly candidateBreakdowns: ReadonlyArray<{
+    readonly candidateId: string;
+    readonly label: string;
+    readonly trialsAttempted: number;
+    readonly trialsCompleted: number;
+    readonly trialsCutoff: number;
+    readonly trialsFailed: number;
+    readonly wins: number;
+    readonly losses: number;
+    readonly draws: number;
+    readonly winRateDenominator: number;
+    readonly empiricalWinRate: number | null;
+    readonly wilson95Lower: number | null;
+    readonly wilson95Upper: number | null;
+  }>;
+}
+
+export type ComparisonToLegacyClassification =
+  | "same_top_candidate"
+  | "evidence_favors_experimental_top"
+  | "evidence_favors_legacy"
+  | "no_clear_difference"
+  | "insufficient_data"
+  | "legacy_top_unsupported";
+
+export interface ComparisonToLegacySummary {
+  readonly legacyTopCandidateId?: string;
+  readonly experimentalTopCandidateId?: string;
+  readonly classification: ComparisonToLegacyClassification;
+  readonly mcnemarPValue: number | null;
+  readonly pairedCompletedTrials: number;
+  readonly discordantCounts: {
+    readonly experimentalTopWonLegacyLost: number;
+    readonly legacyWonExperimentalTopLost: number;
+  };
+  readonly explanation: string;
 }
 
 export type ShadowReportStatus =
@@ -414,7 +493,15 @@ export interface ShadowEvaluationReport {
   readonly diceDiagnostics?: ShadowDiceDiagnostics;
   readonly candidateEvaluations: readonly CandidateShadowEvaluation[];
   readonly experimentalTopCandidateId?: string;
+  /**
+   * Boolean agreement flag with strict comparison semantics:
+   * - `true`: exactly the same top candidate as legacy recommendation (`same_top_candidate`).
+   * - `false`: statistically significant difference favoring experimental top or legacy baseline.
+   * - `null`: no clear statistical difference detected (absence of evidence != equivalence), or insufficient data.
+   */
   readonly experimentalAgreesWithLegacy: boolean | null;
+  readonly comparisonToLegacy?: ComparisonToLegacySummary;
+  readonly sampleAccounting: SampleAccountingSummary;
   readonly budgetDiagnostics: ShadowBudgetDiagnostics;
   readonly timing: ShadowTimingBreakdown;
   readonly warnings: readonly string[];
@@ -473,7 +560,10 @@ const KNOWN_ROLLOUT_AND_MODEL_LIMITATIONS: readonly string[] = [
   "Rollout evaluations use baselineRolloutPolicy ('baseline_heuristic_v1') and do not predict how real human opponents will play or trade.",
   "Balanced Dice models ('balanced_24_of_36_shoe_approx' and 'balanced_stationary_marginal_approx') are provisional empirical approximations (isExact: false), not exact reproductions of proprietary Colonist server code.",
   "Colonist 1v1 per-player seven-streak / relative seven-distribution balancing is not modeled; 7 probabilities depend only on aggregate roll history.",
-  "Domestic player-to-player trades are disabled during baseline rollouts; only legal maritime/bank trades are simulated."
+  "Domestic player-to-player trades are disabled during baseline rollouts; only legal maritime/bank trades are simulated.",
+  "Common Random Numbers guarantees identical initial determinized states across all candidates on trial i, and decouples dice, theft, and policy stochastic streams. However, downstream rollout trajectories diverge once different candidate actions alter board structure or game length; identical future dice sequences cannot be guaranteed across divergent game lengths.",
+  "Paired difference testing (McNemar test) tests for evidence of difference across matched initial determinized worlds (trial index pairing); a non-significant result (p >= 0.05) indicates no clear difference, not equivalence, and does not claim equivalence without a defined equivalence margin.",
+  "Empirical win rates and Wilson intervals strictly use completed games as the denominator; cutoffs and errors are recorded separately as incomplete trials and are neither counted as wins nor losses."
 ];
 
 const sumHand = (h: ResourceHand): number => RESOURCES.reduce((s, r) => s + h[r], 0);
@@ -1381,6 +1471,36 @@ export function mapLegacyCandidateToSimulatedAction(
 // 7. Statistical Helpers (Wilson 95% Interval, Median, Paired Deltas)
 // ============================================================================
 
+/**
+ * Computes the exact two-tailed binomial p-value under H0: P(success) = 0.5.
+ * Used for McNemar's exact test on discordant pairs (b vs c).
+ *
+ * For n discordant pairs with k = min(b, c):
+ * Two-tailed p = min(1.0, 2 * sum_{i=0}^k (n choose i) * 0.5^n).
+ * If n === 0, returns 1.0 (no discordant pairs observed).
+ * If k === n / 2, returns 1.0.
+ */
+export function computeExactTwoTailedBinomialPValue(
+  n: number,
+  k: number,
+  p0 = 0.5
+): number | null {
+  if (n < 0 || k < 0 || k > n) return null;
+  if (n === 0) return 1.0;
+  if (p0 !== 0.5) return null;
+  if (k * 2 === n) return 1.0;
+  const smaller = Math.min(k, n - k);
+  // Term-by-term summation using incremental factor to prevent numeric overflow
+  let term = Math.pow(0.5, n);
+  let cdf = term;
+  for (let i = 1; i <= smaller; i++) {
+    term = (term * (n - i + 1)) / i;
+    cdf += term;
+  }
+  const twoTailed = 2 * cdf;
+  return Math.min(1.0, Math.max(0.0, twoTailed));
+}
+
 export function computeWilson95Interval(wins: number, completed: number): WilsonConfidenceInterval | null {
   if (completed <= 0 || wins < 0 || wins > completed) return null;
   const z = 1.959963984540054;
@@ -1793,7 +1913,8 @@ export function evaluateCandidatesShadow(
           initialRollHistory: trialRollHistory,
           diceAlignmentStatus: alignmentStatus,
           policy,
-          validateEveryStep: config?.validateEveryStep ?? false
+          validateEveryStep: config?.validateEveryStep ?? false,
+          separateDomainStreams: true
         };
 
         const rolloutRes = runRollout(
