@@ -561,7 +561,7 @@ const KNOWN_ROLLOUT_AND_MODEL_LIMITATIONS: readonly string[] = [
   "Balanced Dice models ('balanced_24_of_36_shoe_approx' and 'balanced_stationary_marginal_approx') are provisional empirical approximations (isExact: false), not exact reproductions of proprietary Colonist server code.",
   "Colonist 1v1 per-player seven-streak / relative seven-distribution balancing is not modeled; 7 probabilities depend only on aggregate roll history.",
   "Domestic player-to-player trades are disabled during baseline rollouts; only legal maritime/bank trades are simulated.",
-  "Common Random Numbers guarantees identical initial determinized states across all candidates on trial i, and decouples dice, theft, and policy stochastic streams. However, downstream rollout trajectories diverge once different candidate actions alter board structure or game length; identical future dice sequences cannot be guaranteed across divergent game lengths.",
+  "Common Random Numbers guarantees identical initial determinized states across all candidates on trial i. The shared step-0 seed is only comparable when candidates consume the same stochastic event type; continuation streams are seeded identically but their future draws are paired only while candidates consume the same domains in the same order. Different actions can therefore change dice, development-card, theft, and policy draw positions, so identical future outcomes are not claimed.",
   "Paired difference testing (McNemar test) tests for evidence of difference across matched initial determinized worlds (trial index pairing); a non-significant result (p >= 0.05) indicates no clear difference, not equivalence, and does not claim equivalence without a defined equivalence margin.",
   "Empirical win rates and Wilson intervals strictly use completed games as the denominator; cutoffs and errors are recorded separately as incomplete trials and are neither counted as wins nor losses."
 ];
@@ -1623,6 +1623,14 @@ export function evaluateCandidatesShadow(
       legacyRecommendation: { ...legacySummary },
       candidateEvaluations: [],
       experimentalAgreesWithLegacy: null,
+      sampleAccounting: {
+        totalRolloutsAttempted: 0,
+        totalRolloutsCompleted: 0,
+        totalRolloutsCutoff: 0,
+        totalRolloutsFailed: 0,
+        candidatesEvaluatedCount: 0,
+        candidateBreakdowns: []
+      },
       budgetDiagnostics: {
         configured: budget,
         candidatesSubmitted: candidates.length,
@@ -1631,6 +1639,10 @@ export function evaluateCandidatesShadow(
         candidatesSkippedByCap: 0,
         determinizationsAttempted: 0,
         determinizationsSucceeded: 0,
+        totalRolloutsAttempted: 0,
+        totalRolloutsCompleted: 0,
+        totalRolloutsCutoff: 0,
+        totalRolloutsFailed: 0,
         totalRolloutsExecuted: 0,
         totalSimulatedActions: 0,
         stoppedByElapsedBudget: false,
@@ -1673,6 +1685,14 @@ export function evaluateCandidatesShadow(
       ...(supportCheck.diceDiagnostics ? { diceDiagnostics: supportCheck.diceDiagnostics } : {}),
       candidateEvaluations: [],
       experimentalAgreesWithLegacy: null,
+      sampleAccounting: {
+        totalRolloutsAttempted: 0,
+        totalRolloutsCompleted: 0,
+        totalRolloutsCutoff: 0,
+        totalRolloutsFailed: 0,
+        candidatesEvaluatedCount: 0,
+        candidateBreakdowns: []
+      },
       budgetDiagnostics: {
         configured: budget,
         candidatesSubmitted: candidates.length,
@@ -1681,6 +1701,10 @@ export function evaluateCandidatesShadow(
         candidatesSkippedByCap: 0,
         determinizationsAttempted: 0,
         determinizationsSucceeded: 0,
+        totalRolloutsAttempted: 0,
+        totalRolloutsCompleted: 0,
+        totalRolloutsCutoff: 0,
+        totalRolloutsFailed: 0,
         totalRolloutsExecuted: 0,
         totalSimulatedActions: 0,
         stoppedByElapsedBudget: false,
@@ -1815,8 +1839,9 @@ export function evaluateCandidatesShadow(
       determinizationsSucceeded += 1;
       const baseConcreteState = detRes.state;
 
-      // Common Random Numbers for trialIdx: all candidates share the same initial step outcome RNG seed
-      // and continuation rollout RNG seed on trialIdx!
+      // All candidates share the same initial determinized state. Seeds are matched by trial,
+      // but future draws are only paired while candidates consume the same stochastic domains
+      // in the same order; divergent actions can consume different numbers/types of draws.
       const step0Seed = deriveTrialSeed(baseSeed, trialIdx, "shadow-step0-outcome");
       const contSeed = deriveTrialSeed(baseSeed, trialIdx, "shadow-rollout-continuation");
 
@@ -1973,6 +1998,10 @@ export function evaluateCandidatesShadow(
         evaluationStatus: "unsupported_candidate",
         isSufficientlySupported: false,
         statusReason: acc.mapping.unsupportedReason,
+        trialsAttempted: 0,
+        trialsCompleted: 0,
+        trialsCutoff: 0,
+        trialsFailed: 0,
         determinizationAttempts: 0,
         determinizationSuccesses: 0,
         completedGames: 0,
@@ -1981,9 +2010,12 @@ export function evaluateCandidatesShadow(
         draws: 0,
         cutoffs: { total: 0, maxTurns: 0, maxActions: 0, budgetExhausted: 0 },
         failures: { total: 0, determinizationFailed: 0, illegalAction: 0, rolloutError: 0 },
+        winRateDenominator: 0,
         empiricalWinRateAmongCompleted: null,
+        conservativeWinRateAllAttempts: null,
         completionRate: 0,
         wilson95Interval: null,
+        intervalDefinition: "Wilson 95% interval over completed terminal outcomes only.",
         cutoffVpMarginEstimate: null,
         medianTurnsAmongCompleted: null,
         medianActionsAmongCompleted: null,
@@ -1999,6 +2031,10 @@ export function evaluateCandidatesShadow(
         evaluationStatus: "skipped_budget_candidate_cap",
         isSufficientlySupported: false,
         statusReason: `Skipped due to budget.maxCandidates cap (${budget.maxCandidates}).`,
+        trialsAttempted: 0,
+        trialsCompleted: 0,
+        trialsCutoff: 0,
+        trialsFailed: 0,
         determinizationAttempts: 0,
         determinizationSuccesses: 0,
         completedGames: 0,
@@ -2007,9 +2043,12 @@ export function evaluateCandidatesShadow(
         draws: 0,
         cutoffs: { total: 0, maxTurns: 0, maxActions: 0, budgetExhausted: 0 },
         failures: { total: 0, determinizationFailed: 0, illegalAction: 0, rolloutError: 0 },
+        winRateDenominator: 0,
         empiricalWinRateAmongCompleted: null,
+        conservativeWinRateAllAttempts: null,
         completionRate: 0,
         wilson95Interval: null,
+        intervalDefinition: "Wilson 95% interval over completed terminal outcomes only.",
         cutoffVpMarginEstimate: null,
         medianTurnsAmongCompleted: null,
         medianActionsAmongCompleted: null,
@@ -2073,7 +2112,11 @@ export function evaluateCandidatesShadow(
           bothDrew: acc.draws,
           pairedWinRateDelta: 0,
           pairedDeltaStandardError: 0,
-          classification: "self_baseline"
+          mcnemarPValue: 1,
+          significanceAlpha: 0.05,
+          minCompletedTrialsRequired: budget.minCompletedTrialsForSupport,
+          classification: "self_baseline",
+          explanation: "This candidate is the legacy baseline; no paired difference is tested."
         };
       } else {
         let pairedCompleted = 0;
@@ -2111,20 +2154,28 @@ export function evaluateCandidatesShadow(
             : 0) >= budget.minCompletionRateForSupport;
 
         let classification: PairedComparisonSummary["classification"];
+        const significanceAlpha = 0.05;
+        const minCompletedTrialsRequired = budget.minCompletedTrialsForSupport;
+        const discordantTrials = candWonBaseLost + baseWonCandLost;
+        const mcnemarPValue = computeExactTwoTailedBinomialPValue(
+          discordantTrials,
+          Math.min(candWonBaseLost, baseWonCandLost)
+        );
         if (
           !isSufficientlySupported ||
           !legacyTopSupported ||
-          pairedCompleted < budget.minCompletedTrialsForSupport ||
+          pairedCompleted < minCompletedTrialsRequired ||
           delta === null ||
-          se === null
+          se === null ||
+          mcnemarPValue === null
         ) {
-          classification = "inconclusive_difference";
-        } else if (delta > 0 && delta - 1.96 * se > 0) {
-          classification = "experimental_disagreement";
-        } else if (delta <= 0) {
-          classification = "agrees_with_legacy";
+          classification = "insufficient_data";
+        } else if (mcnemarPValue < significanceAlpha && candWonBaseLost > baseWonCandLost) {
+          classification = "evidence_favors_candidate";
+        } else if (mcnemarPValue < significanceAlpha && baseWonCandLost > candWonBaseLost) {
+          classification = "evidence_favors_legacy";
         } else {
-          classification = "inconclusive_difference";
+          classification = "no_clear_difference";
         }
 
         comparisonVsLegacyTop = {
@@ -2137,7 +2188,18 @@ export function evaluateCandidatesShadow(
           bothDrew,
           pairedWinRateDelta: delta,
           pairedDeltaStandardError: se,
-          classification
+          mcnemarPValue,
+          significanceAlpha,
+          minCompletedTrialsRequired,
+          classification,
+          explanation:
+            classification === "insufficient_data"
+              ? `Inconclusive: requires ${minCompletedTrialsRequired} paired completed trials and supported candidates.`
+              : classification === "no_clear_difference"
+                ? `Inconclusive: McNemar p=${mcnemarPValue.toFixed(4)} is not below alpha=${significanceAlpha}.`
+                : classification === "evidence_favors_candidate"
+                  ? `Evidence favors the candidate: McNemar p=${mcnemarPValue.toFixed(4)} < alpha=${significanceAlpha}.`
+                  : `Evidence favors the legacy baseline: McNemar p=${mcnemarPValue.toFixed(4)} < alpha=${significanceAlpha}.`
         };
       }
     }
@@ -2148,6 +2210,10 @@ export function evaluateCandidatesShadow(
       evaluationStatus,
       isSufficientlySupported,
       statusReason,
+      trialsAttempted: acc.completedGames + totalCutoffs + totalFailures,
+      trialsCompleted: acc.completedGames,
+      trialsCutoff: totalCutoffs,
+      trialsFailed: totalFailures,
       determinizationAttempts: acc.determinizationAttempts,
       determinizationSuccesses: acc.determinizationSuccesses,
       completedGames: acc.completedGames,
@@ -2166,9 +2232,13 @@ export function evaluateCandidatesShadow(
         illegalAction: acc.illegalActionFailures,
         rolloutError: acc.rolloutErrors
       },
+      winRateDenominator: acc.completedGames,
       empiricalWinRateAmongCompleted: empiricalWinRate,
+      conservativeWinRateAllAttempts:
+        acc.determinizationAttempts > 0 ? acc.wins / acc.determinizationAttempts : null,
       completionRate,
       wilson95Interval: wilson,
+      intervalDefinition: "Wilson 95% interval over completed terminal outcomes only.",
       cutoffVpMarginEstimate: cutoffVpMargin,
       medianTurnsAmongCompleted: computeMedian(acc.completedTurnsList),
       medianActionsAmongCompleted: computeMedian(acc.completedActionsList),
@@ -2190,7 +2260,8 @@ export function evaluateCandidatesShadow(
   const experimentalAgreesWithLegacy =
     experimentalTopCandidateId && legacyTopEval?.isSufficientlySupported
       ? experimentalTopCandidateId === legacyTopEval.candidate.candidateId ||
-        sortedByWinRate[0]?.comparisonVsLegacyTop?.classification !== "experimental_disagreement"
+        (sortedByWinRate[0]?.comparisonVsLegacyTop?.classification !== "evidence_favors_candidate" &&
+          sortedByWinRate[0]?.comparisonVsLegacyTop?.classification !== "evidence_favors_legacy")
       : null;
 
   const anySufficient = supportedEvals.length > 0;
@@ -2205,6 +2276,10 @@ export function evaluateCandidatesShadow(
 
   const aggregationMs = nowMs() - aggStartMs;
   const totalElapsedMs = nowMs() - totalStartMs;
+  const totalRolloutsAttempted = candidateEvaluations.reduce((sum, e) => sum + e.trialsAttempted, 0);
+  const totalRolloutsCompleted = candidateEvaluations.reduce((sum, e) => sum + e.trialsCompleted, 0);
+  const totalRolloutsCutoff = candidateEvaluations.reduce((sum, e) => sum + e.trialsCutoff, 0);
+  const totalRolloutsFailed = candidateEvaluations.reduce((sum, e) => sum + e.trialsFailed, 0);
 
   const report: ShadowEvaluationReport = {
     mode: "shadow_only",
@@ -2219,6 +2294,28 @@ export function evaluateCandidatesShadow(
     candidateEvaluations,
     ...(experimentalTopCandidateId !== undefined ? { experimentalTopCandidateId } : {}),
     experimentalAgreesWithLegacy,
+    sampleAccounting: {
+      totalRolloutsAttempted,
+      totalRolloutsCompleted,
+      totalRolloutsCutoff,
+      totalRolloutsFailed,
+      candidatesEvaluatedCount: candidateEvaluations.filter((e) => e.trialsAttempted > 0).length,
+      candidateBreakdowns: candidateEvaluations.map((e) => ({
+        candidateId: e.candidate.candidateId,
+        label: e.candidate.label,
+        trialsAttempted: e.trialsAttempted,
+        trialsCompleted: e.trialsCompleted,
+        trialsCutoff: e.trialsCutoff,
+        trialsFailed: e.trialsFailed,
+        wins: e.wins,
+        losses: e.losses,
+        draws: e.draws,
+        winRateDenominator: e.winRateDenominator,
+        empiricalWinRate: e.empiricalWinRateAmongCompleted,
+        wilson95Lower: e.wilson95Interval?.lower ?? null,
+        wilson95Upper: e.wilson95Interval?.upper ?? null
+      }))
+    },
     budgetDiagnostics: {
       configured: budget,
       candidatesSubmitted: candidates.length,
@@ -2227,6 +2324,10 @@ export function evaluateCandidatesShadow(
       candidatesSkippedByCap,
       determinizationsAttempted,
       determinizationsSucceeded,
+      totalRolloutsAttempted,
+      totalRolloutsCompleted,
+      totalRolloutsCutoff,
+      totalRolloutsFailed,
       totalRolloutsExecuted,
       totalSimulatedActions,
       stoppedByElapsedBudget,
@@ -2340,5 +2441,3 @@ export function evaluateRobberTargetsShadow(
   };
   return evaluateCandidatesShadow(input, legacySummary, candidates, config);
 }
-
-

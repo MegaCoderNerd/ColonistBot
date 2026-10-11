@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 import { decodeFrames } from "../src/analyzer/decode";
@@ -81,9 +82,15 @@ import { robberTargets } from "../src/analyzer/advisor";
 import { createHelper } from "../src/extension/helper";
 import type { Recording } from "../src/shared/schema";
 
-const RECORDINGS_PATH = "C:/Users/ashma/Downloads/colonist-recordings-2026-10-08.json";
+const RECORDINGS_PATH =
+  process.env.COLONIST_RECORDINGS_PATH ??
+  [resolve(__dirname, "../fixtures/colonist-recordings.json"), resolve(__dirname, "../colonist-recordings.json")].find(
+    (path) => existsSync(path)
+  );
+const recordingsAvailable = RECORDINGS_PATH !== undefined && existsSync(RECORDINGS_PATH);
 
 function loadRecordings(): Recording[] {
+  if (!RECORDINGS_PATH || !existsSync(RECORDINGS_PATH)) return [];
   const raw = JSON.parse(readFileSync(RECORDINGS_PATH, "utf8")) as { recordings: Recording[] };
   return raw.recordings;
 }
@@ -92,7 +99,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
   const recordings = loadRecordings();
 
   describe("1. BoardTopology Construction, Reciprocal Adjacency & Colonist ID Mapping", () => {
-    it("constructs complete 19-hex, 54-corner, 72-edge, 9-port topology with reciprocal adjacency and cached lookup", () => {
+    it.skipIf(!recordingsAvailable)("constructs complete 19-hex, 54-corner, 72-edge, 9-port topology with reciprocal adjacency and cached lookup (recording fixture required)", () => {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const board = parsed.board!;
@@ -156,7 +163,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       }
     });
 
-    it("preserves original Colonist corner, edge, and hex IDs distinctly from internal array indices", () => {
+    it.skipIf(!recordingsAvailable)("preserves original Colonist corner, edge, and hex IDs distinctly from internal array indices (recording fixture required)", () => {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const topo = getBoardTopology(parsed.board!);
@@ -199,7 +206,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
   });
 
   describe("2. Canonical Observed State Reconstruction & Confidence Boundaries", () => {
-    it("reconstructs placements, road lengths, public/hidden VP, and uncertain opponent state on edge9896, farm9373, and deck7708", () => {
+    it.skipIf(!recordingsAvailable)("reconstructs placements, road lengths, public/hidden VP, and uncertain opponent state on edge9896, farm9373, and deck7708 (recording fixture required)", () => {
       // 1. edge9896: self (c5) has 8 visible VP + 0 hidden VP; opponent (c1) has 14 visible VP + 0 confirmed hidden VP + 2 unknown devs (maxPossibleVp = 16)
       const edgeRec = recordings.find((r) => r.id === "edge9896")!;
       const edgeParsed = stateDiffAdapter.parse(decodeFrames(edgeRec.frames).decoded);
@@ -347,7 +354,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       });
     });
 
-    it("preserves authoritative gameSettings, distinguishes defaults and unknown values, and refuses to map unrecognized phases to main", () => {
+    it.skipIf(!recordingsAvailable)("preserves authoritative gameSettings, distinguishes defaults and unknown values, and refuses to map unrecognized phases to main (recording fixture required)", () => {
       const farmRec = recordings.find((r) => r.id === "farm9373")!;
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
@@ -407,7 +414,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(classifyTurnPhase(9, 0)).toEqual({ phase: "unknown", confidence: "unrecognized" });
     });
 
-    it("handles mid-game or incomplete observations without fabricating exact state and separates observed vs concrete simulation validation", () => {
+    it.skipIf(!recordingsAvailable)("handles mid-game or incomplete observations without fabricating exact state and separates observed vs concrete simulation validation (recording fixture required)", () => {
       const farmRec = recordings.find((r) => r.id === "farm9373")!;
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
@@ -503,7 +510,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(validateConcreteSimState(simState).valid).toBe(false);
     });
 
-    it("supports 2–6 player seat order structurally and preserves boundaries for adaptive behavior telemetry, imperfect priors, and observed trades", () => {
+    it.skipIf(!recordingsAvailable)("supports 2–6 player seat order structurally and preserves boundaries for adaptive behavior telemetry, imperfect priors, and observed trades (recording fixture required)", () => {
       const farmRec = recordings.find((r) => r.id === "farm9373")!;
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
 
@@ -574,7 +581,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       });
     });
 
-    it("reconstructs valid ObservedGameState across all 53 captured recordings and measures reconstruction & clone latency", () => {
+    it.skipIf(!recordingsAvailable)("reconstructs valid ObservedGameState across all 53 captured recordings and measures reconstruction & clone latency (recording fixture required)", () => {
       let buildTopoMs = 0;
       let cachedTopoMs = 0;
       let buildStateWithReadMs = 0;
@@ -651,7 +658,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
   });
 
-  describe("Stage 3.2 — Rule-Correct Shared-Board Legal-Action & State-Transition Engine", () => {
+  describe.skipIf(!recordingsAvailable)("Stage 3.2 — Rule-Correct Shared-Board Legal-Action & State-Transition Engine (recording fixture required)", () => {
     function getStandardTopology() {
       const farm = recordings.find((r) => r.id === "farm9373")!;
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
@@ -715,7 +722,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       }
     }
 
-    it("1. Setup snake order, initial resource grant on 2nd settlement, setup road attachment, and farm9373 replay parity", () => {
+    it.skipIf(!recordingsAvailable)("1. Setup snake order, initial resource grant on 2nd settlement, setup road attachment, and farm9373 replay parity (recording fixture required)", () => {
       const topo = getStandardTopology();
       const initRes = createInitialConcreteState({
         topology: topo,
@@ -1549,7 +1556,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(validateConcreteSimState(state).valid).toBe(true);
     });
 
-    it("8. Enforces strict 3-way information boundary on materializeConcreteState and fails closed on unsupported variants/rulesets", () => {
+    it.skipIf(!recordingsAvailable)("8. Enforces strict 3-way information boundary on materializeConcreteState and fails closed on unsupported variants/rulesets (recording fixture required)", () => {
       const farmRec = recordings.find((r) => r.id === "farm9373")!;
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
@@ -1896,7 +1903,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(explicitOverride.model.isExact).toBe(false);
     });
 
-    it("3. Recording-level empirical dice partitioning and holdout calibration (51 1v1 games vs 2 4P Rush games)", () => {
+    it.skipIf(!recordingsAvailable)("3. Recording-level empirical dice partitioning and holdout calibration (51 1v1 games vs 2 4P Rush games) (recording fixture required)", () => {
       // Partition all 53 recordings by gameSettings (modeSetting, maxPlayers, diceSetting)
       const oneVOneRollSeqs: number[][] = [];
       const rush4pRollSeqs: number[][] = [];
@@ -1953,7 +1960,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(calShoe.brierPerRoll).toBeLessThan(calFair.brierPerRoll - 0.01);
     });
 
-    it("4–8. Hidden-Information Determinization: exact self hands, bounded opponent hands, resource conservation, and dev-card sampling without replacement", () => {
+    it.skipIf(!recordingsAvailable)("4–8. Hidden-Information Determinization: exact self hands, bounded opponent hands, resource conservation, and dev-card sampling without replacement (recording fixture required)", () => {
       // Mid-game state from farm9373 (frame 1000: turnState=2, actionState=0 -> phase 'main')
       const farmRec = recordings.find((r) => r.id === "farm9373")!;
       const { decoded } = decodeFrames(farmRec.frames.slice(0, 1000));
@@ -2099,7 +2106,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       ).toBe(snapshotBefore);
     });
 
-    it("9–10. Determinization diagnostic failures for inconsistent or impossible observed constraints without mutating input", () => {
+    it.skipIf(!recordingsAvailable)("9–10. Determinization diagnostic failures for inconsistent or impossible observed constraints without mutating input (recording fixture required)", () => {
       const baseObs = buildMidgameObservedFixture("farm9373", 1000);
 
       // Case A: sum(knownMin) > handSize
@@ -2189,7 +2196,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       }
     });
 
-    it("11–14. Baseline Rollout Engine: reproducibility, legal-action-only execution, immediate win handling, and cutoff/error statuses", () => {
+    it.skipIf(!recordingsAvailable)("11–14. Baseline Rollout Engine: reproducibility, legal-action-only execution, immediate win handling, and cutoff/error statuses (recording fixture required)", () => {
       const topo = buildMidgameObservedFixture("farm9373", 1000).topology;
       const initRes = createInitialConcreteState({
         topology: topo,
@@ -2360,7 +2367,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(illegalPolicyRes.completed).toBe(false);
     });
 
-    it("15–16. Batch determinized rollouts, incomplete-trial accounting, model comparison, and Stage 3.3 performance benchmarks", () => {
+    it.skipIf(!recordingsAvailable)("15–16. Batch determinized rollouts, incomplete-trial accounting, model comparison, and Stage 3.3 performance benchmarks (recording fixture required)", () => {
       const midgameObs = buildMidgameObservedFixture("farm9373", 1000);
       expect(validateObservedState(midgameObs).valid).toBe(true);
 
@@ -2478,7 +2485,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       return { rec, frames, decoded, parsed, placements, me, opp };
     }
 
-    it("1. Preserves default coach behavior across planTurn, coachedOpening, robberTargets, and createHelper", () => {
+    it.skipIf(!recordingsAvailable)("1. Preserves default coach behavior across planTurn, coachedOpening, robberTargets, and createHelper (recording fixture required)", () => {
       for (const recId of ["farm9373", "edge9896", "deck7708"]) {
         const { parsed, placements, me, rec } = parseFixtureSlice(recId, 850);
         const board = parsed.board!;
@@ -2591,7 +2598,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       }
     });
 
-    it("2. Reconstructs canonical ObservedGameState from live coach inputs while separating authoritative facts, inferred bounds, and sampled states", () => {
+    it.skipIf(!recordingsAvailable)("2. Reconstructs canonical ObservedGameState from live coach inputs while separating authoritative facts, inferred bounds, and sampled states (recording fixture required)", () => {
       const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
 
@@ -2647,7 +2654,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(reconUnknown.epistemicLayers.authoritativeFacts.selfHandExact).toBe(false);
     });
 
-    it("3. Enforces supported vs unsupported state, topology, ruleset, phase, perspective, and dice mode gating", () => {
+    it.skipIf(!recordingsAvailable)("3. Enforces supported vs unsupported state, topology, ruleset, phase, perspective, and dice mode gating (recording fixture required)", () => {
       const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
 
@@ -2787,7 +2794,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(gateOverriddenDice.supported).toBe(true);
     });
 
-    it("4. Maps supported coach candidates to exact SimulatedAction objects and explicitly marks compound/unsupported candidates", () => {
+    it.skipIf(!recordingsAvailable)("4. Maps supported coach candidates to exact SimulatedAction objects and explicitly marks compound/unsupported candidates (recording fixture required)", () => {
       const { parsed, placements, me, opp } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const recon = reconstructObservedStateForShadow({
@@ -3057,7 +3064,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       }
     });
 
-    it("5. Rejects illegal candidate actions via isActionLegal and applyAction on the cloned determinized state", () => {
+    it.skipIf(!recordingsAvailable)("5. Rejects illegal candidate actions via isActionLegal and applyAction on the cloned determinized state (recording fixture required)", () => {
       const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const activeSnap = {
@@ -3139,7 +3146,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(passCand.completedGames).toBeGreaterThan(0);
     });
 
-    it("6 & 7. Evaluates candidates on paired determinized samples with order-independent seeds and deterministic repeatability", () => {
+    it.skipIf(!recordingsAvailable)("6 & 7. Evaluates candidates on paired determinized samples with order-independent seeds and deterministic repeatability (recording fixture required)", () => {
       const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const activeSnap = {
@@ -3239,7 +3246,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       );
     });
 
-    it("8. Separates completed games from cutoffs and failures and computes honest Wilson intervals", () => {
+    it.skipIf(!recordingsAvailable)("8. Separates completed games from cutoffs and failures and computes honest Wilson intervals (recording fixture required)", () => {
       const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const activeSnap = {
@@ -3306,7 +3313,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(wAll.upper).toBe(1);
     });
 
-    it("9 & 10. Enforces runtime budgets (candidates, trials, total rollouts, elapsed ms, simulated actions) and stale-work cancellation", () => {
+    it.skipIf(!recordingsAvailable)("9 & 10. Enforces runtime budgets (candidates, trials, total rollouts, elapsed ms, simulated actions) and stale-work cancellation (recording fixture required)", () => {
       const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const activeSnap = {
@@ -3478,7 +3485,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(actionBudgetReport.budgetDiagnostics.stoppedByActionCap).toBe(true);
     });
 
-    it("11 & 12. Evaluates dice-model selection/fallback and compares legacy ranking vs shadow rollout evaluation on representative positions", () => {
+    it.skipIf(!recordingsAvailable)("11 & 12. Evaluates dice-model selection/fallback and compares legacy ranking vs shadow rollout evaluation on representative positions (recording fixture required)", () => {
       const { parsed, placements, me } = parseFixtureSlice("farm9373", 900);
       const board = parsed.board!;
       const activeSnap = {
@@ -3649,7 +3656,3 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
   });
 });
-
-
-
-
