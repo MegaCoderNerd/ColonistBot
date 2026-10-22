@@ -1,8 +1,8 @@
 // Recovered from content.js (lines 2613-2852)
 import { edgePoints, pointKey } from "../geometry";
-import { contextFor, isLegal, occupiedMap, profileOf, scoreSpot, type BoardContext } from "../strategy";
+import { contextFor, isLegal, occupiedMap, portReportFor, profileOf, scoreSpot, type BoardContext } from "../strategy";
 import type { Board, Placements } from "../types";
-import { portAccess } from "./ports";
+import { resourcesImprovedByHarbor } from "./ports";
 import { bestEdge } from "./value";
 
 const pair = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
@@ -217,36 +217,20 @@ export function adviseRoad(
   const taken = new Set(built.keys());
   if (opts.from) taken.add(opts.from);
   const own = profileOf(ctx, placements, (o) => o === me);
+  const ownedRates = portReportFor(ctx, placements, me).rates.rates;
   for (const corner of ctx.corners) {
     if (!isLegal(ctx, corner.at, taken)) continue;
-    const spot = scoreSpot(ctx, corner, own, taken);
-    const portNote = corner.port ? (corner.port === "any" ? " on a 3:1 port" : ` on the 2:1 ${corner.port} port`) : "";
+    const spot = scoreSpot(ctx, corner, own, taken, ownedRates);
+    const portNote =
+      corner.port && resourcesImprovedByHarbor(ownedRates, corner.port).length > 0
+        ? corner.port === "any"
+          ? " on a 3:1 port"
+          : ` on the 2:1 ${corner.port} port`
+        : "";
     consider(
       corner.at,
       (step) => spot.value - step.dist * 1.2,
       (step) => `Build the highlighted road toward ${spotText(corner.at)}${portNote}. ${left(step.dist)}`
-    );
-  }
-  const dist = new Map<string, number>();
-  for (const at of mine) dist.set(at, 0);
-  const seen = new Set(mine);
-  const queue = [...mine].filter((n) => !blocked.has(n));
-  for (let i = 0; i < queue.length; i++) {
-    const at = queue[i];
-    for (const next of adj.get(at) ?? []) {
-      if (seen.has(next.to) || blocked.has(next.to)) continue;
-      seen.add(next.to);
-      dist.set(next.to, (dist.get(at) ?? 0) + 1);
-      queue.push(next.to);
-    }
-  }
-  const ports = portAccess(ctx, dist, own);
-  if (ports[0] && ports[0].roads > 0) {
-    const port = ports[0];
-    consider(
-      port.at,
-      (step) => port.value * 5 - step.dist * 0.4,
-      (step) => `Build the highlighted road toward the ${port.text}. ${left(step.dist)}`
     );
   }
   const chain = longestRoad(graph, blocked);

@@ -793,10 +793,17 @@ export function buildObservedGameState(input: ObservedStateInput): ObservedGameS
 
     let ratiosConfidence: ObservedPlayerState["ratiosConfidence"] = "derived_from_ports";
     if (snap && Object.keys(snap.ratios).length > 0) {
+      // A quoted 4:1 must not erase a harbor a settlement or city already grants.
+      // A better quoted rate is kept when the placement is behind the snapshot.
+      let snapshotAgrees = true;
       for (const r of RESOURCES) {
-        if (snap.ratios[r] !== undefined) ratios[r] = snap.ratios[r]!;
+        const quoted = snap.ratios[r];
+        if (quoted === 2 || quoted === 3 || quoted === 4) {
+          if (quoted > ratios[r]) snapshotAgrees = false;
+          ratios[r] = Math.min(ratios[r], quoted);
+        } else snapshotAgrees = false;
       }
-      ratiosConfidence = "authoritative";
+      if (snapshotAgrees) ratiosConfidence = "authoritative";
     }
 
     for (let ei = 0; ei < topology.edges.length; ei++) {

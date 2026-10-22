@@ -1,6 +1,16 @@
 // Recovered from content.js (lines 1254-1692)
 import { boardCorners, edgePoints, pointKey, type CornerInfo } from "./geometry";
-import { portAccess, portsNear, portWorth } from "./engine/ports";
+import {
+  applyHarborToRates,
+  assessPortAccess,
+  portWorth,
+  portsNear,
+  ratesFromPlacements,
+  resourcesImprovedByHarbor,
+  viablePortTargets,
+  describePortTarget,
+  type PortAccessReport
+} from "./engine/ports";
 import { pips } from "./replay";
 import { RESOURCES, type Board, type HexTile, type Placements, type PortKind, type Resource, type ResourceHand } from "./types";
 import type { ShadowEvaluationReport } from "./engine/shadow";
@@ -120,7 +130,25 @@ export function isLegal(ctx: BoardContext, at: string, taken: Set<string>): bool
   return !(ctx.nbrs.get(at) ?? []).some((n) => taken.has(n));
 }
 
-export function scoreSpot(ctx: BoardContext, c: CornerInfo, own: ResourceHand, taken: Set<string>): { at: string; value: number; pips: number; tags: string[] } {
+export function portReportFor(ctx: BoardContext, placements: Placements, playerId: string): PortAccessReport {
+  const taken = new Set(occupiedMap(placements).keys());
+  return assessPortAccess({
+    ctx,
+    placements,
+    playerId,
+    myDistance: roadDistance(ctx, placements, (owner) => owner === playerId),
+    opponentDistance: roadDistance(ctx, placements, (owner) => owner !== playerId),
+    settlementLegal: (at) => isLegal(ctx, at, taken)
+  });
+}
+
+export function scoreSpot(
+  ctx: BoardContext,
+  c: CornerInfo,
+  own: ResourceHand,
+  taken: Set<string>,
+  rates?: ResourceHand
+): { at: string; value: number; pips: number; tags: string[] } {
   const tags: string[] = [];
   const hexes = c.hexIds.map((id) => ctx.hexById.get(id)).filter((h): h is HexTile => Boolean(h));
   const kinds = new Set<Resource>();
@@ -186,16 +214,19 @@ export function scoreSpot(ctx: BoardContext, c: CornerInfo, own: ResourceHand, t
     value -= 1;
     tags.push("cramped");
   } else if (room >= 4) tags.push("room to expand");
-  if (c.port === "any") {
-    value += 3.2;
-    tags.push("3:1 port");
-  } else if (c.port) {
-    const feed = pipsHere[c.port] + own[c.port];
-    value += feed >= 4 ? 3.6 + Math.min(1.2, 0.12 * feed) : 1.8;
-    tags.push(`2:1 ${LABEL[c.port]} port`);
+  const harborHelps = (kind: PortKind | undefined) => !kind || !rates || resourcesImprovedByHarbor(rates, kind).length > 0;
+  if (c.port && harborHelps(c.port)) {
+    if (c.port === "any") {
+      value += 3.2;
+      tags.push("3:1 port");
+    } else {
+      const feed = pipsHere[c.port] + own[c.port];
+      value += feed >= 4 ? 3.6 + Math.min(1.2, 0.12 * feed) : 1.8;
+      tags.push(`2:1 ${LABEL[c.port]} port`);
+    }
   }
   for (const near of portsNear(ctx, c.at, 2)) {
-    if (near.dist === 0) continue;
+    if (near.dist === 0 || !harborHelps(near.kind)) continue;
     if (near.dist === 1 && near.kind === "any") value += 2.6;
     else if (near.dist === 1 && near.kind !== "any" && (pipsHere[near.kind] >= 4 || own[near.kind] >= 4)) value += 2.8;
     const worth = near.dist === 1 ? 0 : portWorth(near.kind, own, pipsHere, near.dist);
@@ -214,10 +245,10 @@ export function legalCorners(ctx: BoardContext, taken: Set<string>): CornerInfo[
   return ctx.corners.filter((c) => isLegal(ctx, c.at, taken));
 }
 
-function rankFor(ctx: BoardContext, profile: ResourceHand, taken: Set<string>) {
+function rankFor(ctx: BoardContext, profile: ResourceHand, taken: Set<string>, rates?: ResourceHand) {
   return legalCorners(ctx, taken)
     .map((c) => {
-      const s = scoreSpot(ctx, c, profile, taken);
+      const s = scoreSpot(ctx, c, profile, taken, rates);
       return { at: c.at, value: s.value, s };
     })
     .sort((a, b) => b.value - a.value);
@@ -273,12 +304,14 @@ export function planOpening(board: Board, placements: Placements, me: string, li
   else mode = "second";
   if (myTurn === false) mode = "waiting";
   else if (myTurn === true && mode === "waiting") mode = "second";
-  const theirs = rankFor(ctx, his, taken);
+  const myRates = ratesFromPlacements(ctx, placements, (owner) => owner === me);
+  const hisRates = ratesFromPlacements(ctx, placements, (owner) => owner !== me);
+  const theirs = rankFor(ctx, his, taken, hisRates);
   const oppWants = theirs.slice(0, 3).map((r) => ({ at: r.at, reason: describe(ctx, r.at, r.s.tags.slice(0, 3)) }));
   if (mode === "waiting") return { mode, picks: [], oppWants, note: NOTES[mode] };
   const followWeight = mode === "first" ? 0.6 : mode === "pair" ? 0.9 : 0;
   const denialWeight = mode === "last" ? 0 : 0.5;
-  const mine = rankFor(ctx, own, taken);
+  const mine = rankFor(ctx, own, taken, myRates);
   const scored = mine.map((cand) => {
     const dn = denialWeight ? denial(ctx, theirs, cand.at) : 0;
     let follow = 0;
@@ -292,16 +325,21 @@ export function planOpening(board: Board, placements: Placements, me: string, li
       if (mode === "first") {
         t2 = new Set(t1);
         let his2 = his;
+        let hisRatesAfter = hisRates;
         for (let i = 0; i < 2; i++) {
-          const pick = rankFor(ctx, his2, t2)[0];
+          const pick = rankFor(ctx, his2, t2, hisRatesAfter)[0];
           if (!pick) break;
           t2.add(pick.at);
           hisProjected.push(pick.at);
           his2 = withCorner(ctx, his2, pick.at);
+          const takenPort = ctx.byAt.get(pick.at)?.port;
+          if (takenPort) hisRatesAfter = applyHarborToRates(hisRatesAfter, takenPort);
         }
       }
-      const hisAfter = mode === "pair" ? rankFor(ctx, his, t1) : [];
-      const best = rankFor(ctx, own1, t2)
+      const pickedPort = ctx.byAt.get(cand.at)?.port;
+      const ownRatesAfter = pickedPort ? applyHarborToRates(myRates, pickedPort) : myRates;
+      const hisAfter = mode === "pair" ? rankFor(ctx, his, t1, hisRates) : [];
+      const best = rankFor(ctx, own1, t2, ownRatesAfter)
         .map((r) => ({ r, v: r.value + (mode === "pair" ? 0.4 * denial(ctx, hisAfter, r.at) : 0) }))
         .sort((a, b) => b.v - a.v)[0];
       if (best) {
@@ -409,7 +447,9 @@ export function planMidgame(board: Board, placements: Placements, me: string): M
   const his = profileOf(ctx, placements, isHim);
   const myDist = roadDistance(ctx, placements, isMe);
   const hisDist = roadDistance(ctx, placements, isHim);
-  const ports = portAccess(ctx, myDist, own, hisDist);
+  const portReport = portReportFor(ctx, placements, me);
+  const myRates = portReport.rates.rates;
+  const hisRates = ratesFromPlacements(ctx, placements, isHim);
   const spread = (spots: MidgameSpot[], limit: number) => {
     const picked: MidgameSpot[] = [];
     for (const s of spots.sort((a, b) => b.score - a.score)) {
@@ -424,14 +464,12 @@ export function planMidgame(board: Board, placements: Placements, me: string): M
   for (const c of legalCorners(ctx, taken)) {
     const d = myDist.get(c.at) ?? Infinity;
     const hd = hisDist.get(c.at) ?? Infinity;
-    const mineScore = scoreSpot(ctx, c, own, taken);
-    const hisScore = scoreSpot(ctx, c, his, taken);
+    const mineScore = scoreSpot(ctx, c, own, taken, myRates);
+    const hisScore = scoreSpot(ctx, c, his, taken, hisRates);
     if (d <= 2) {
       const tags = [roadsText(d), ...mineScore.tags.slice(0, 3)];
       if (hd <= 2) tags.push(`he can reach it too (${hd === 0 ? "now" : `${hd} road${hd > 1 ? "s" : ""}`})`);
-      const portBonus = c.port ? ports.find((p) => p.at === c.at)?.value ?? 0 : 0;
-      if (portBonus >= 0.4 && c.port) tags.push(c.port === "any" ? "takes the 3:1" : `takes the 2:1 ${LABEL[c.port]}`);
-      expansion.push({ at: c.at, dist: d, score: mineScore.value - 1.4 * d + (hd <= 2 ? 0.3 * hisScore.value : 0) + portBonus, reason: describe(ctx, c.at, tags) });
+      expansion.push({ at: c.at, dist: d, score: mineScore.value - 1.4 * d + (hd <= 2 ? 0.3 * hisScore.value : 0), reason: describe(ctx, c.at, tags) });
     }
     if (hd <= 2) {
       const tags = [roadsText(hd).replace("your", "his")];
@@ -472,7 +510,12 @@ export function planMidgame(board: Board, placements: Placements, me: string): M
     upgrade = `City on ${best.numbers.join("/")} (${best.pips} pips). ${why}`;
   }
   const weaknesses: string[] = [];
-  if (ports[0] && ports[0].value >= 0.55) weaknesses.push(`Port: ${ports[0].text}. A spot that reaches it is worth more than the same pips inland.`);
+  const nextPort = viablePortTargets(portReport)
+    .filter((port) => (port.roadsRemaining ?? 99) <= 4)
+    .sort((a, b) => (a.roadsRemaining ?? 99) - (b.roadsRemaining ?? 99))[0];
+  if (nextPort && portWorth(nextPort.kind, own, emptyProfile(), nextPort.roadsRemaining ?? 0, nextPort.opponentRoadsRemaining) >= 0.55) {
+    weaknesses.push(`Port: ${describePortTarget(nextPort)}. A spot that reaches a new harbor is worth more than the same pips inland.`);
+  }
   const missing = (p: ResourceHand) => RESOURCES.filter((r) => p[r] === 0);
   const mineMissing = missing(own);
   if (mineMissing.length) weaknesses.push(`You produce no ${mineMissing.map((r) => LABEL[r]).join(" or ")}; expansion spots that add it rank higher.`);

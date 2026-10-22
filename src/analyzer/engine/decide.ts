@@ -1,11 +1,12 @@
 // Recovered from content.js (lines 3219-3921)
 import { publicVp } from "../advisor";
 import type { GameSnapshot, PlayerSnapshot } from "../snapshot";
-import { contextFor, hexDependence, profileOf, roadDistance, type BoardContext } from "../strategy";
+import { contextFor, hexDependence, portReportFor, profileOf, roadDistance, type BoardContext } from "../strategy";
 import { COSTS } from "../tracker";
 import { RESOURCES, type Board, type DevCardKind, type GameEvent, type Placements, type Resource, type ResourceBag, type ResourceHand } from "../types";
 import type { CoachTip } from "./actions";
-import { portAccess, type PortAccessItem } from "./ports";
+import { describePortTarget, mergeTradeRates, viablePortTargets, type PortAccessItem } from "./ports";
+import { RACE_EVALUATOR_ID, type RaceAssessment } from "./race";
 import { bagAligned, canBuild, chooseSettlement, cityPick, holdingResource, rankLiveSpots, situationBrief, worthTheRoad, type RankedLiveSpot } from "./read";
 import { longestExtensions, networkLength, roadToward } from "./roads";
 import { bestEdge, mostLikelyRolls, nextRollText, positionWin, sevensText } from "./value";
@@ -44,6 +45,15 @@ export interface TurnPlan {
   road?: { edge: string; toward?: string; buildNow: boolean; reason: string };
   road2?: { edge: string; toward?: string; reason: string };
   roadLater?: { edge: string; reason: string };
+  /** Policy and race signals behind this recommendation. Advisory only. */
+  evaluation?: {
+    evaluatorId: typeof RACE_EVALUATOR_ID;
+    target?: string;
+    signals?: Pick<
+      RaceAssessment,
+      "lost" | "possibleThreat" | "urgent" | "certainty" | "myRoads" | "opponentRoads" | "myTurns" | "opponentTurns" | "adjustment" | "reason"
+    >;
+  };
   shadowEvaluation?: ShadowEvaluationReport;
 }
 
@@ -59,7 +69,21 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const oppId = oppSnap?.id ?? [...input.placements.settlements, ...input.placements.cities, ...input.placements.roads].map(([, owner]) => owner).find((owner) => owner !== input.me);
   const myVp = vpOf(meSnap, input.placements, input.me);
   const hisVp = visibleVpOf(oppSnap, input.placements, oppId);
-  const ratios = ratiosOf(meSnap);
+  const portReport = portReportFor(ctx, input.placements, input.me);
+  const ratios = mergeTradeRates(ratiosOf(meSnap), portReport.rates.rates);
+  const pursuePort = viablePortTargets(portReport)
+    .filter((port) => port.roadsRemaining !== undefined && port.roadsRemaining >= 1 && port.roadsRemaining <= 2)
+    .sort((a, b) => a.roadsRemaining! - b.roadsRemaining! || Number(b.kind !== "any") - Number(a.kind !== "any"))[0];
+  const nearPort: PortAccessItem | undefined = pursuePort
+    ? {
+        at: pursuePort.at,
+        kind: pursuePort.kind,
+        roads: pursuePort.roadsRemaining!,
+        value: pursuePort.improvedResources.length,
+        contested: pursuePort.opponentRoadsRemaining !== undefined && pursuePort.opponentRoadsRemaining < pursuePort.roadsRemaining!,
+        text: describePortTarget(pursuePort)
+      }
+    : undefined;
   const hand = input.hand ?? { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 };
   const known = input.handKnown !== false && input.hand !== undefined;
   const cards = playableCardsOf(meSnap);
@@ -80,7 +104,10 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
     handSize: handSizes,
     devsInHand,
     knights: knightCount,
-    completedTurns: input.snapshot?.completedTurns
+    completedTurns: input.snapshot?.completedTurns,
+    myHand: known ? hand : undefined,
+    opponentKnown: input.oppHand,
+    opponentUnknown: input.oppUnknown
   });
   const roadRich = own.lumber >= 4 && own.brick >= 4;
   const choice = chooseSettlement(ranked.spots, roadRich);
@@ -128,7 +155,6 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const myBuildings = myCities + [...input.placements.settlements.values()].filter((o) => o === input.me).length;
   const haveCity = myCities >= 1;
   const thirdClose = Boolean(haveCity && spot && spot.dist >= 1 && spot.dist <= 2);
-  const nearPort = portAccess(ctx, roadDistance(ctx, input.placements, (o) => o === input.me), own).find((p) => p.roads >= 1 && p.roads <= 2);
   const portStep = nearPort ? roadToward(input.board, input.placements, input.me, nearPort.at) : undefined;
   const portName = nearPort ? (nearPort.kind === "any" ? "3:1 port" : `2:1 ${LABEL[nearPort.kind]} port`) : "port";
   const onFour = RESOURCES.every((r) => ratios[r] >= 4);
@@ -191,7 +217,14 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   const alignedBag = bagAligned(input.snapshot?.completedTurns, seenRolls.length);
   const discardLimit = meSnap?.discardLimit ?? input.snapshot?.gameSettings?.cardDiscardLimit ?? 9;
   if (action === "yop" && !rolled && known && total(hand) + 2 > discardLimit) action = canCity ? "city" : cityClose ? "cityTrade" : "hold";
-  const edgePick = bestEdge(input.board, input.placements, input.me, { rolls: seenRolls, aligned: alignedBag, hand, maxDist: 2 });
+  const edgePick = bestEdge(input.board, input.placements, input.me, {
+    rolls: seenRolls,
+    aligned: alignedBag,
+    hand: known ? hand : undefined,
+    opponentKnown: input.oppHand,
+    opponentUnknown: input.oppUnknown,
+    maxDist: 2
+  });
   const legacyCandidateWinPcts = new Map<string, number>();
   const locked = action === "army" || action === "knight" || action === "yop" || action === "roadBuild" || action === "burst" || action === "trophy" || action === "trophy2" || action === "port";
   if (!locked && known) {
@@ -558,7 +591,8 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
     alt: choice.alt && choice.alt.at !== shown?.at ? { at: choice.alt.at, reason: choice.alt.reason } : undefined,
     road,
     road2,
-    roadLater
+    roadLater,
+    evaluation: raceEvaluation(shown ?? spot)
   };
 
   if (input.shadowRollout?.enabled !== true) {
@@ -617,6 +651,30 @@ export function planTurn(input: TurnPlanInput): TurnPlan {
   return {
     ...basePlan,
     shadowEvaluation
+  };
+}
+
+function raceEvaluation(spot: RankedLiveSpot | undefined): TurnPlan["evaluation"] {
+  const race = spot?.race;
+  return {
+    evaluatorId: RACE_EVALUATOR_ID,
+    ...(spot ? { target: spot.at } : {}),
+    ...(race
+      ? {
+          signals: {
+            lost: race.lost,
+            possibleThreat: race.possibleThreat,
+            urgent: race.urgent,
+            certainty: race.certainty,
+            myRoads: race.myRoads,
+            opponentRoads: race.opponentRoads,
+            myTurns: race.myTurns,
+            opponentTurns: race.opponentTurns,
+            adjustment: race.adjustment,
+            reason: race.reason
+          }
+        }
+      : {})
   };
 }
 
@@ -774,8 +832,7 @@ function secondFreeRoad(
   if (spot && spot.dist > 1) aim(spot.at, `Second road toward ${spot.numbers.join("/")} (${spot.pips} pips).`, 28);
   for (const s of spots) {
     if (s.dist < 1 || s.dist > 4) continue;
-    const portBonus = s.port && s.port !== "any" ? 4 : s.port === "any" ? 2 : 0;
-    aim(s.at, `Second road toward ${s.numbers.join("/")} (${s.pips} pips).`, s.value - 2 * s.dist + portBonus);
+    aim(s.at, `Second road toward ${s.numbers.join("/")} (${s.pips} pips).`, s.value - 2 * s.dist);
   }
   if (port) aim(port.at, `Second road to the port. ${port.text}`, preferPort ? 40 : 12);
   if (best) return { edge: best.edge, toward: best.toward, reason: best.reason };

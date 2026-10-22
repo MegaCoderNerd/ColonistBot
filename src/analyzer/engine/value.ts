@@ -1,6 +1,8 @@
 // Recovered from content.js (lines 2303-2611)
-import { contextFor, isLegal, occupiedMap, profileOf, roadDistance, scoreSpot, type BoardContext } from "../strategy";
+import { contextFor, isLegal, occupiedMap, portReportFor, profileOf, roadDistance, scoreSpot, type BoardContext } from "../strategy";
 import { RESOURCES, type Board, type Placements, type Resource, type ResourceBag, type ResourceHand } from "../types";
+import { assessSettlementRace, routeIsDeadEnd } from "./race";
+import { ratesFromPlacements, resourcesImprovedByHarbor } from "./ports";
 import { listOpenEdges, roadToward } from "./roads";
 import { applyPort, newPlayer, payValue, pipOf, race, type SimPlayer, type SimProd } from "./sim";
 
@@ -217,7 +219,16 @@ export function rankEdges(
   board: Board,
   placements: Placements,
   me: string,
-  opts: { from?: string; onlyFrom?: boolean; maxDist?: number; rolls?: RollInput[]; aligned?: boolean; hand?: ResourceBag } = {}
+  opts: {
+    from?: string;
+    onlyFrom?: boolean;
+    maxDist?: number;
+    rolls?: RollInput[];
+    aligned?: boolean;
+    hand?: ResourceBag;
+    opponentKnown?: ResourceBag;
+    opponentUnknown?: number;
+  } = {}
 ): RankedEdge[] {
   const maxDist = opts.maxDist ?? 2;
   const edges = listOpenEdges(board, placements, me, opts.from, opts.onlyFrom);
@@ -228,7 +239,10 @@ export function rankEdges(
   const taken = new Set(built.keys());
   if (opts.from) taken.add(opts.from);
   const own = profileOf(ctx, placements, (o) => o === me);
+  const his = profileOf(ctx, placements, (o) => o !== me);
   const hisDist = roadDistance(ctx, placements, (o) => o !== me);
+  const ownedRates = portReportFor(ctx, placements, me).rates.rates;
+  const hisRates = ratesFromPlacements(ctx, placements, (owner) => owner !== me);
   const hand = opts.hand ?? {};
   const needWheat = Math.max(0, 2 - (hand.grain ?? 0));
   const needOre = Math.max(0, 3 - (hand.ore ?? 0));
@@ -247,24 +261,38 @@ export function rankEdges(
       sheep: boolean;
       label: string;
       pay: string;
+      lost: boolean;
+      myTurns: number;
     }> = [];
     for (const corner of ctx.corners) {
       if (!isLegal(ctx, corner.at, taken)) continue;
       const step = roadToward(board, placements, me, corner.at, opts.onlyFrom ? opts.from : undefined);
       if (!step || step.edge !== edge.edge || step.dist < 1 || step.dist > maxDist) continue;
-      const scored = scoreSpot(ctx, corner, own, taken);
+      const scored = scoreSpot(ctx, corner, own, taken, ownedRates);
       const faces = payFaces(corner.numbers, bag.left);
       const fair = fairFaces(corner.numbers) / 36;
       const rate = bag.bagLeft > 0 ? faces / bag.bagLeft : 0;
       const hd = hisDist.get(corner.at);
-      const contest = hd !== undefined && hd <= 2 ? (step.dist <= hd ? 2.4 : -3) : 0;
+      const race = assessSettlementRace({
+        myRoads: step.dist,
+        opponentRoads: hd,
+        myProduction: own,
+        opponentProduction: his,
+        myHand: opts.hand,
+        opponentKnown: opts.opponentKnown,
+        opponentUnknown: opts.opponentUnknown,
+        myRates: ownedRates,
+        opponentRates: hisRates,
+        portImproves: Boolean(corner.port && resourcesImprovedByHarbor(ownedRates, corner.port).length > 0),
+        weActFirst: true
+      });
       const ore = corner.resources.filter((r) => r === "ore").length;
       const wheat = corner.resources.filter((r) => r === "grain").length;
       const clock =
         hyperAtLeast(needWheat, Math.min(8, bag.bagLeft), Math.min(bag.bagLeft, wheatNow + wheat * faces), bag.bagLeft) *
         hyperAtLeast(needOre, Math.min(8, bag.bagLeft), Math.min(bag.bagLeft, oreNow + ore * faces), bag.bagLeft);
       const sheep = corner.pips > 0 && corner.resources.filter((r) => r === "wool").length * 5 >= corner.pips * 0.6 && ore + wheat === 0;
-      const score = scored.value + (rate - fair) * 40 - repeatedPips(corner.numbers) * 0.9 + contest - step.dist * 1.4 + (clock - clockNow) * 8;
+      const score = scored.value + (rate - fair) * 40 - repeatedPips(corner.numbers) * 0.9 - step.dist * 1.4 + (clock - clockNow) * 8 + race.adjustment;
       spots.push({
         at: corner.at,
         dist: step.dist,
@@ -273,13 +301,16 @@ export function rankEdges(
         pips: corner.pips,
         sheep,
         label: `${corner.numbers.join("/")} (${corner.pips} pips)`,
-        pay: `pays on ${faces} of the remaining ${bag.bagLeft}`
+        pay: `pays on ${faces} of the remaining ${bag.bagLeft}`,
+        lost: race.lost,
+        myTurns: race.myTurns
       });
     }
     spots.sort((a, b) => b.score - a.score);
-    const best = spots[0];
-    const second = spots[1];
-    const dead = !best;
+    const dead = routeIsDeadEnd(spots);
+    const usable = spots.filter((spot) => !spot.lost && Number.isFinite(spot.myTurns));
+    const best = usable[0] ?? spots[0];
+    const second = (usable.length ? usable : spots).find((spot) => spot !== best);
     const score = dead ? -50 : best.score + (second ? second.score * 0.25 : 0);
     let follow: string | undefined;
     if (best && best.dist >= 2) follow = roadToward(board, withRoad(placements, edge.edge, me), me, best.at)?.edge;
@@ -289,7 +320,13 @@ export function rankEdges(
   return ranked.map((row, i) => {
     const other = ranked.find((_, j) => j !== i);
     let reason: string;
-    if (row.dead) reason = "This road dies. Nothing legal to settle is within two roads.";
+    if (row.dead) {
+      reason = row.best?.lost
+        ? "This road dies. He can take the settlement first."
+        : row.best
+          ? "This road dies. You cannot pay for the settlement it reaches."
+          : "This road dies. Nothing legal to settle is within two roads.";
+    }
     else {
       reason = `This road leaves toward ${row.best.label}, ${row.best.pay}.`;
       if (other?.dead) reason += " The other road dies.";
@@ -304,7 +341,16 @@ export function bestEdge(
   board: Board,
   placements: Placements,
   me: string,
-  opts: { from?: string; onlyFrom?: boolean; maxDist?: number; rolls?: RollInput[]; aligned?: boolean; hand?: ResourceBag } = {}
+  opts: {
+    from?: string;
+    onlyFrom?: boolean;
+    maxDist?: number;
+    rolls?: RollInput[];
+    aligned?: boolean;
+    hand?: ResourceBag;
+    opponentKnown?: ResourceBag;
+    opponentUnknown?: number;
+  } = {}
 ): RankedEdge | undefined {
   return rankEdges(board, placements, me, opts)[0];
 }

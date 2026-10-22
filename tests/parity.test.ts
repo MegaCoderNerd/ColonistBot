@@ -66,7 +66,12 @@ const STAGE_2_AND_3_MODIFIED_MODULES = new Set([
   "// src/analyzer/engine/sim.ts",
   "// src/analyzer/engine/rng.ts",
   "// src/analyzer/engine/opening.ts",
-  "// src/extension/helper.ts"
+  "// src/extension/helper.ts",
+  // Port access and settlement-race planning edited these original modules.
+  "// src/analyzer/engine/ports.ts",
+  "// src/analyzer/strategy.ts",
+  "// src/analyzer/engine/value.ts",
+  "// src/analyzer/engine/read.ts"
 ]);
 
 const STAGE_3_NEW_MODULES = new Set([
@@ -76,7 +81,8 @@ const STAGE_3_NEW_MODULES = new Set([
   "// src/analyzer/engine/determinize.ts",
   "// src/analyzer/engine/diceModel.ts",
   "// src/analyzer/engine/rollout.ts",
-  "// src/analyzer/engine/shadow.ts"
+  "// src/analyzer/engine/shadow.ts",
+  "// src/analyzer/engine/race.ts"
 ]);
 
 describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () => {
@@ -88,15 +94,18 @@ describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () =>
     }
   });
 
-  it("preserves identical relative module order for all 34 original src/ modules, includes the 7 Stage 3 engine modules, and preserves 100% AST/token parity on all untouched original modules in dist/firefox/content.js", () => {
+  it("preserves identical relative module order for all 34 original src/ modules, includes the 8 Stage 3 engine modules, and preserves 100% AST/token parity on all untouched original modules in dist/firefox/content.js", () => {
     const base = normalizeBundle(readFileSync(resolve(ROOT, "content.js"), "utf8"));
     const built = normalizeBundle(readFileSync(resolve(ROOT, "dist/firefox/content.js"), "utf8"));
     const baseHeaders = base.split("\n").filter((l) => l.startsWith("  // src/"));
     const builtHeaders = built.split("\n").filter((l) => l.startsWith("  // src/"));
     const builtOriginalHeaders = builtHeaders.filter((l) => !STAGE_3_NEW_MODULES.has(l.trim()));
+    const raceHeaders = builtHeaders.filter((l) => l.trim() === "// src/analyzer/engine/race.ts");
+    expect(STAGE_3_NEW_MODULES.size).toBe(8);
+    expect(raceHeaders).toHaveLength(1);
     expect(builtOriginalHeaders).toEqual(baseHeaders);
     expect(baseHeaders.length).toBe(34);
-    expect(builtHeaders.length).toBe(34 + STAGE_3_NEW_MODULES.size);
+    expect(builtHeaders.length).toBe(42);
 
     const baseMods = splitModules(base.replace("\n    void extra;", ""));
     const builtMods = splitModules(built);

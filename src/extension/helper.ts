@@ -7,13 +7,13 @@ import { bestEdge, nextRollText, positionWin, sevensText } from "../analyzer/eng
 import { bagAligned } from "../analyzer/engine/read";
 import { planTurn, type TurnPlan } from "../analyzer/engine/decide";
 import { evaluateCandidatesShadow, type ShadowEvaluationReport, type ShadowRolloutConfig } from "../analyzer/engine/shadow";
-import { portAccess } from "../analyzer/engine/ports";
+import { describePortTarget, viablePortTargets } from "../analyzer/engine/ports";
 import { decodeFrames, type DecodedFrame } from "../analyzer/decode";
 import { stateDiffAdapter } from "../analyzer/adapters/stateDiff";
 import { typedEventsAdapter } from "../analyzer/adapters/typedEvents";
 import { pickPrimary } from "../analyzer/parse";
 import { DEFAULT_VIEW } from "../analyzer/geometry";
-import { contextFor, planMidgame, profileOf, roadDistance, type OpeningPick, type OpeningPlan } from "../analyzer/strategy";
+import { contextFor, planMidgame, portReportFor, type OpeningPick, type OpeningPlan } from "../analyzer/strategy";
 import { COSTS, emptyHand, type PlayerHandView } from "../analyzer/tracker";
 import { RESOURCES, type Resource, type ResourceHand } from "../analyzer/types";
 import type { MapView, WsFrame } from "../shared/schema";
@@ -336,11 +336,9 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
       const plan = planMemo.plan;
       shadowEvaluation = plan.shadowEvaluation;
       const boardCtx = contextFor(board);
-      const ports = portAccess(
-        boardCtx,
-        roadDistance(boardCtx, placements, (o) => o === who.id),
-        profileOf(boardCtx, placements, (o) => o === who.id)
-      );
+      const nextHarbor = viablePortTargets(portReportFor(boardCtx, placements, who.id))
+        .filter((port) => (port.roadsRemaining ?? 99) >= 1)
+        .sort((a, b) => (a.roadsRemaining ?? 99) - (b.roadsRemaining ?? 99))[0];
       picks = plan.picks;
       lines.push(plan.note);
       const follow = picks[0]?.followUp;
@@ -392,7 +390,7 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
         held > limit
           ? `You hold ${held} cards. Drop ${Math.floor(held / 2)} if a 7 comes before you can spend them. ${sevensText(rolls, aligned, who.id)}`
           : `${sevensText(rolls, aligned, who.id)}${held >= limit - 2 && held > 0 ? ` You hold ${held}, close to the discard of ${limit}.` : ""}`;
-      coach = coachFromOpening(plan, ports[0] && ports[0].value >= 0.5 ? ports[0].text : undefined, { first: setupRoad?.reason, second: secondRoad?.reason });
+      coach = coachFromOpening(plan, nextHarbor ? describePortTarget(nextHarbor) : undefined, { first: setupRoad?.reason, second: secondRoad?.reason });
       coach = {
         ...coach,
         race: `About ${pct}% from here. ${next}`,

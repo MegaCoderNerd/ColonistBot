@@ -1,4 +1,6 @@
 import { RESOURCES, type Resource, type ResourceBag, type ResourceHand } from "../types";
+import { resourcesImprovedByHarbor } from "./ports";
+import { assessSettlementRace, type RaceAssessment } from "./race";
 import {
   sampleDeterminization,
   type DeterminizationDiagnostics,
@@ -216,7 +218,7 @@ export function findImmediateWinningAction(
   return undefined;
 }
 
-function scoreCornerForPlayer(state: ConcreteSimulatedGameState, cornerIndex: number): number {
+function scoreCornerForPlayer(state: ConcreteSimulatedGameState, cornerIndex: number, playerId?: string): number {
   const corner = state.topology.corners[cornerIndex];
   if (!corner) return 0;
   let score = 0;
@@ -228,8 +230,10 @@ function scoreCornerForPlayer(state: ConcreteSimulatedGameState, cornerIndex: nu
     seenRes.add(hex.resource);
   }
   score += seenRes.size * 0.75;
-  if (corner.port === "any") score += 1.5;
-  else if (corner.port) score += 2.0;
+  const rates = playerId ? state.players.find((player) => player.id === playerId)?.ratios : undefined;
+  if (corner.port && (!rates || resourcesImprovedByHarbor(rates, corner.port).length > 0)) {
+    score += corner.port === "any" ? 1.5 : 2.0;
+  }
   return score;
 }
 
@@ -250,12 +254,13 @@ function minAdditionalRoadsToOpenSettlementFromEdge(
   playerId: string,
   edgeIndex: number,
   maxDepth = 3
-): { dist: number; bestCornerScore: number } {
+): { dist: number; bestCornerScore: number; cornerIndex?: number } {
   const edge = state.topology.edges[edgeIndex];
-  if (!edge) return { dist: 99, bestCornerScore: 0 };
+  if (!edge) return { dist: 99, bestCornerScore: 0, cornerIndex: undefined };
 
   let bestDist = 99;
   let bestScore = 0;
+  let bestCorner = -1;
 
   // BFS over corners starting from the endpoints of `edgeIndex`
   const queue: Array<{ cornerIdx: number; d: number }> = [
@@ -271,10 +276,11 @@ function minAdditionalRoadsToOpenSettlementFromEdge(
     if (d > bestDist) break;
 
     if (isCornerDistanceOpen(state, cornerIdx)) {
-      const sc = scoreCornerForPlayer(state, cornerIdx);
+      const sc = scoreCornerForPlayer(state, cornerIdx, playerId);
       if (d < bestDist || (d === bestDist && sc > bestScore)) {
         bestDist = d;
         bestScore = sc;
+        bestCorner = cornerIdx;
       }
     }
 
@@ -300,7 +306,101 @@ function minAdditionalRoadsToOpenSettlementFromEdge(
     }
   }
 
-  return { dist: bestDist, bestCornerScore: bestScore };
+  return { dist: bestDist, bestCornerScore: bestScore, cornerIndex: bestCorner >= 0 ? bestCorner : undefined };
+}
+
+function productionOf(state: ConcreteSimulatedGameState, playerId: string): ResourceHand {
+  const out: ResourceHand = { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 };
+  for (let cornerIndex = 0; cornerIndex < state.cornerOwner.length; cornerIndex++) {
+    if (state.cornerOwner[cornerIndex] !== playerId) continue;
+    const weight = state.cornerPiece[cornerIndex] === 2 ? 2 : 1;
+    for (const hexIndex of state.topology.corners[cornerIndex].hexIndices) {
+      const hex = state.topology.hexes[hexIndex];
+      if (hex.resource && hex.pips > 0) out[hex.resource] += hex.pips * weight;
+    }
+  }
+  return out;
+}
+
+/** Additional roads for `playerId`. Owned edges cost nothing. Opponent roads and buildings block. */
+function roadsFromPlayer(state: ConcreteSimulatedGameState, playerId: string, goal: number): number | undefined {
+  const distance = new Map<number, number>();
+  for (let cornerIndex = 0; cornerIndex < state.cornerOwner.length; cornerIndex++) {
+    if (state.cornerOwner[cornerIndex] === playerId) distance.set(cornerIndex, 0);
+  }
+  for (let edgeIndex = 0; edgeIndex < state.edgeOwner.length; edgeIndex++) {
+    if (state.edgeOwner[edgeIndex] !== playerId) continue;
+    const edge = state.topology.edges[edgeIndex];
+    for (const cornerIndex of [edge.c1, edge.c2]) {
+      if ((distance.get(cornerIndex) ?? Infinity) > 0) distance.set(cornerIndex, 0);
+    }
+  }
+  const done = new Set<number>();
+  for (;;) {
+    let current: number | undefined;
+    for (const [cornerIndex, cost] of distance) {
+      if (done.has(cornerIndex)) continue;
+      if (current === undefined || cost < distance.get(current)!) current = cornerIndex;
+    }
+    if (current === undefined) return distance.get(goal);
+    done.add(current);
+    if (current === goal) return distance.get(current);
+    const occupier = state.cornerOwner[current];
+    if (occupier && occupier !== playerId) continue;
+    const corner = state.topology.corners[current];
+    for (let i = 0; i < corner.incidentEdgeIndices.length; i++) {
+      const edgeIndex = corner.incidentEdgeIndices[i];
+      const next = corner.adjacentCornerIndices[i];
+      const owner = state.edgeOwner[edgeIndex];
+      if (owner && owner !== playerId) continue;
+      const nextCost = distance.get(current)! + (owner === playerId ? 0 : 1);
+      if (nextCost < (distance.get(next) ?? Infinity)) distance.set(next, nextCost);
+    }
+  }
+}
+
+/**
+ * Race against observed roads and public production. The opponent's card types stay
+ * unknown: only the public hand size is passed, never the hidden resources.
+ */
+function raceToCorner(state: ConcreteSimulatedGameState, actorId: string, cornerIndex: number, myRoads: number): RaceAssessment {
+  const actor = state.players.find((player) => player.id === actorId);
+  let closest: { roads: number; playerId: string } | undefined;
+  for (const player of state.players) {
+    if (player.id === actorId) continue;
+    const roads = roadsFromPlayer(state, player.id, cornerIndex);
+    if (roads === undefined) continue;
+    if (!closest || roads < closest.roads) closest = { roads, playerId: player.id };
+  }
+  const opponent = closest ? state.players.find((player) => player.id === closest.playerId) : undefined;
+  const corner = state.topology.corners[cornerIndex];
+  return assessSettlementRace({
+    myRoads,
+    opponentRoads: closest?.roads,
+    myProduction: productionOf(state, actorId),
+    opponentProduction: opponent ? productionOf(state, opponent.id) : { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 },
+    myHand: actor?.hand,
+    opponentKnown: opponent ? { lumber: 0, brick: 0, wool: 0, grain: 0, ore: 0 } : undefined,
+    opponentUnknown: opponent ? sumHand(opponent.hand) : undefined,
+    myRates: actor?.ratios,
+    opponentRates: opponent?.ratios,
+    portImproves: Boolean(corner?.port && actor && resourcesImprovedByHarbor(actor.ratios, corner.port).length > 0),
+    myRoadsLeft: actor?.roadsLeft,
+    opponentRoadsLeft: opponent?.roadsLeft,
+    weActFirst: true
+  });
+}
+
+function raceScore(
+  state: ConcreteSimulatedGameState,
+  actorId: string,
+  reach: { dist: number; cornerIndex?: number },
+  base: number,
+  trophy: boolean
+): { score: number; lost: boolean } {
+  if (reach.cornerIndex === undefined || reach.dist >= 99) return { score: base, lost: false };
+  const race = raceToCorner(state, actorId, reach.cornerIndex, reach.dist + 1);
+  return { score: base + race.adjustment, lost: race.lost && !trophy };
 }
 
 function deficitForCost(hand: ResourceHand, cost: ResourceBag): number {
@@ -392,7 +492,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
           .filter((a): a is Extract<SimulatedAction, { type: "placeSetupSettlement" }> => a.type === "placeSetupSettlement")
           .map((action) => ({
             action,
-            score: scoreCornerForPlayer(state, action.cornerIndex)
+            score: scoreCornerForPlayer(state, action.cornerIndex, actorId)
           }))
           .sort((a, b) => b.score - a.score);
         if (scored.length >= 2 && scored[0].score - scored[1].score <= 1.25) {
@@ -405,14 +505,16 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         const roadActions = legalActions.filter(
           (a): a is Extract<SimulatedAction, { type: "placeSetupRoad" }> => a.type === "placeSetupRoad"
         );
-        const scored = roadActions
-          .map((action) => {
-            const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 2);
-            const score = (3 - Math.min(3, reach.dist)) * 5 + reach.bestCornerScore * 0.2;
-            return { action, score };
-          })
-          .sort((a, b) => b.score - a.score);
-        return scored[0]?.action ?? rng.pick(legalActions);
+        const scored = roadActions.map((action) => {
+          const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 2);
+          const base = (3 - Math.min(3, reach.dist)) * 5 + reach.bestCornerScore * 0.2;
+          const raced = raceScore(state, actorId, reach, base, false);
+          return { action, score: raced.score, lost: raced.lost };
+        });
+        const open = scored.filter((row) => !row.lost);
+        const pool = open.length > 0 ? open : scored;
+        pool.sort((a, b) => b.score - a.score);
+        return pool[0]?.action ?? rng.pick(legalActions);
       }
 
       case "pre_roll": {
@@ -495,21 +597,19 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         const freeRoads = legalActions.filter(
           (a): a is Extract<SimulatedAction, { type: "placeFreeRoad" }> => a.type === "placeFreeRoad"
         );
-        let bestRoad = freeRoads[0];
-        let bestScore = -Infinity;
-        for (const action of freeRoads) {
+        const scored = freeRoads.map((action) => {
           const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 3);
           const nextEdgeOwner = [...state.edgeOwner];
           nextEdgeOwner[action.edgeIndex] = actorId;
-          const newLen = computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId);
-          const lenGain = Math.max(0, newLen - actor.roadLength);
-          const sc = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 2.5;
-          if (sc > bestScore) {
-            bestScore = sc;
-            bestRoad = action;
-          }
-        }
-        return bestRoad ?? rng.pick(legalActions);
+          const lenGain = Math.max(0, computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId) - actor.roadLength);
+          const base = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 2.5;
+          const raced = raceScore(state, actorId, reach, base, lenGain > 0);
+          return { action, score: raced.score, lost: raced.lost && lenGain === 0 };
+        });
+        const open = scored.filter((row) => !row.lost);
+        const pool = open.length > 0 ? open : scored;
+        pool.sort((a, b) => b.score - a.score);
+        return pool[0]?.action ?? rng.pick(legalActions);
       }
 
       case "year_of_plenty": {
@@ -526,7 +626,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
           (a): a is Extract<SimulatedAction, { type: "buildCity" }> => a.type === "buildCity"
         );
         if (cityActions.length > 0) {
-          cityActions.sort((a, b) => scoreCornerForPlayer(state, b.cornerIndex) - scoreCornerForPlayer(state, a.cornerIndex));
+          cityActions.sort((a, b) => scoreCornerForPlayer(state, b.cornerIndex, actorId) - scoreCornerForPlayer(state, a.cornerIndex, actorId));
           return cityActions[0];
         }
 
@@ -536,7 +636,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         );
         if (settleActions.length > 0) {
           settleActions.sort(
-            (a, b) => scoreCornerForPlayer(state, b.cornerIndex) - scoreCornerForPlayer(state, a.cornerIndex)
+            (a, b) => scoreCornerForPlayer(state, b.cornerIndex, actorId) - scoreCornerForPlayer(state, a.cornerIndex, actorId)
           );
           return settleActions[0];
         }
@@ -599,22 +699,22 @@ export const baselineRolloutPolicy: RolloutPolicy = {
 
           // Avoid spending our last grain/lumber/brick on extra roads if we already have an open settlement spot
           if (needsExpansionRoad || contestingLongestRoad) {
-            let bestRoad: Extract<SimulatedAction, { type: "buildRoad" }> | undefined;
-            let bestScore = -Infinity;
+            const scored: Array<{ action: Extract<SimulatedAction, { type: "buildRoad" }>; score: number; keep: boolean }> = [];
             for (const action of roadActions) {
               const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 3);
               const nextEdgeOwner = [...state.edgeOwner];
               nextEdgeOwner[action.edgeIndex] = actorId;
-              const newLen = computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId);
-              const lenGain = Math.max(0, newLen - actor.roadLength);
+              const lenGain = Math.max(0, computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId) - actor.roadLength);
               if (needsExpansionRoad && reach.dist > 3 && lenGain === 0) continue;
-              const sc = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 4;
-              if (sc > bestScore) {
-                bestScore = sc;
-                bestRoad = action;
-              }
+              const trophy = contestingLongestRoad && lenGain > 0;
+              const base = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 4;
+              const raced = raceScore(state, actorId, reach, base, trophy);
+              scored.push({ action, score: raced.score, keep: trophy || !raced.lost });
             }
-            if (bestRoad) return bestRoad;
+            const open = scored.filter((row) => row.keep);
+            const pool = open.length > 0 ? open : contestingLongestRoad ? scored : [];
+            pool.sort((a, b) => b.score - a.score);
+            if (pool[0]) return pool[0].action;
           }
         }
 

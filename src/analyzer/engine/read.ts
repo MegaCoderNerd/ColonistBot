@@ -1,6 +1,8 @@
 // Recovered from content.js (lines 2854-3217)
 import { hexesAtCorner, pips } from "../replay";
-import { contextFor, isLegal, occupiedMap, profileOf, roadDistance, scoreSpot, type BoardContext } from "../strategy";
+import { assessSettlementRace, type RaceAssessment } from "./race";
+import { ratesFromPlacements, resourcesImprovedByHarbor } from "./ports";
+import { contextFor, isLegal, occupiedMap, portReportFor, profileOf, roadDistance, scoreSpot, type BoardContext } from "../strategy";
 import { RESOURCES, type Board, type DevCardKind, type GameEvent, type Placements, type PortKind, type Resource, type ResourceBag, type ResourceHand } from "../types";
 import { roadToward } from "./roads";
 import { bagSwing, bestEdge } from "./value";
@@ -48,6 +50,7 @@ export interface RankedLiveSpot {
   value: number;
   tags: string[];
   reason: string;
+  race?: RaceAssessment;
 }
 
 const LABEL: Record<Resource, string> = { lumber: "wood", brick: "brick", wool: "sheep", grain: "wheat", ore: "ore" };
@@ -360,6 +363,9 @@ export function rankLiveSpots(
     devsInHand?: Record<string, number>;
     knights?: Record<string, number>;
     completedTurns?: number;
+    myHand?: ResourceHand;
+    opponentKnown?: ResourceHand;
+    opponentUnknown?: number;
   } = {}
 ): { spots: RankedLiveSpot[]; read: TableRead } {
   const read = readTable(board, events, me, opts);
@@ -370,10 +376,12 @@ export function rankLiveSpots(
   const his = profileOf(ctx, placements, (o) => o !== me);
   const mine = roadDistance(ctx, placements, (o) => o === me);
   const hisReach = roadDistance(ctx, placements, (o) => o !== me);
+  const myRates = portReportFor(ctx, placements, me).rates.rates;
+  const hisRates = ratesFromPlacements(ctx, placements, (owner) => owner !== me);
   const hisBest = new Set(
     ctx.corners
       .filter((c) => isLegal(ctx, c.at, taken))
-      .map((c) => ({ at: c.at, value: scoreSpot(ctx, c, his, taken).value, dist: hisReach.get(c.at) ?? 99 }))
+      .map((c) => ({ at: c.at, value: scoreSpot(ctx, c, his, taken, hisRates).value, dist: hisReach.get(c.at) ?? 99 }))
       .filter((s) => s.dist <= 2)
       .sort((a, b) => b.value - a.value)
       .slice(0, 2)
@@ -386,7 +394,7 @@ export function rankLiveSpots(
     const step = roadToward(board, placements, me, c.at);
     const dist = step ? step.dist : mine.get(c.at) === 0 ? 0 : 99;
     if (dist >= 99) continue;
-    const scored = scoreSpot(ctx, c, own, taken);
+    const scored = scoreSpot(ctx, c, own, taken, myRates);
     const pipsBy = emptyRes();
     for (const id of c.hexIds) {
       const hex = ctx.hexById.get(id);
@@ -408,12 +416,27 @@ export function rankLiveSpots(
     if (distinct.size === 1 && c.pips >= 8) value -= (read.dice.weight[c.numbers[0]] ?? 1) > 1.1 ? 0.25 : 0.7;
     else if (distinct.size >= 2 && c.pips >= 7) value += 0.35;
     const hd = hisReach.get(c.at);
-    const hisScore = scoreSpot(ctx, c, his, taken).value;
-    if (hd !== undefined && hd <= 2 && hisScore >= 9) {
-      if (dist <= hd) {
-        value += Math.min(3.2, 0.22 * hisScore);
-        tags.push("takes a spot he wants");
-      } else value -= hd + 1 < dist ? 5 : 1.6;
+    const hisScore = scoreSpot(ctx, c, his, taken, hisRates).value;
+    const race = assessSettlementRace({
+      myRoads: dist,
+      opponentRoads: hd,
+      myProduction: own,
+      opponentProduction: his,
+      myHand: opts.myHand,
+      opponentKnown: opts.opponentKnown,
+      opponentUnknown: opts.opponentUnknown,
+      myRates,
+      opponentRates: hisRates,
+      portImproves: Boolean(c.port && resourcesImprovedByHarbor(myRates, c.port).length > 0),
+      weActFirst: true
+    });
+    value += race.adjustment;
+    if (race.lost) tags.push("he can take it first");
+    else if (race.possibleThreat) tags.push("he might contest it");
+    else if (race.urgent) tags.push("take it before he can");
+    else if (hd !== undefined && hd <= 2 && dist <= hd && hisScore >= 9) {
+      value += Math.min(3.2, 0.22 * hisScore);
+      tags.push("takes a spot he wants");
     }
     if (hisBest.has(c.at) && dist <= (hd ?? 99)) tags.push("his next spot");
     for (const r of c.resources) {
@@ -456,13 +479,23 @@ export function rankLiveSpots(
       pipsBy,
       value,
       tags,
-      reason: [lead, `${c.pips} pips on ${c.numbers.join("/")}`, ...useful, away].join(", ") + "."
+      reason: [lead, `${c.pips} pips on ${c.numbers.join("/")}`, ...useful, away].join(", ") + ".",
+      race
     });
   }
   spots.sort((a, b) => b.value - a.value);
   for (const spot of spots.slice(0, 8)) {
     if (spot.dist > 2) continue;
-    const leave = bestEdge(board, placements, me, { from: spot.at, onlyFrom: true, maxDist: 2, rolls: seenRolls, aligned: read.dice.aligned });
+    const leave = bestEdge(board, placements, me, {
+      from: spot.at,
+      onlyFrom: true,
+      maxDist: 2,
+      rolls: seenRolls,
+      aligned: read.dice.aligned,
+      hand: opts.myHand,
+      opponentKnown: opts.opponentKnown,
+      opponentUnknown: opts.opponentUnknown
+    });
     if (!leave || leave.dead) spot.value -= 4;
     else spot.value += Math.min(2, Math.max(0, leave.score) * 0.04);
   }
@@ -490,6 +523,7 @@ export function chooseSettlement(
 }
 
 export function worthTheRoad(spot: RankedLiveSpot, own: ResourceHand): boolean {
+  if (spot.race?.lost) return false;
   const precious = own.lumber < 3 && own.brick < 3;
   const freshLumber = own.lumber < 3 ? spot.pipsBy.lumber : 0;
   const freshBrick = own.brick < 3 ? spot.pipsBy.brick : 0;
