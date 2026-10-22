@@ -1,7 +1,7 @@
 // Recovered from content.js (lines 2613-2852)
 import { edgePoints, pointKey } from "../geometry";
 import { contextFor, isLegal, occupiedMap, portReportFor, profileOf, scoreSpot, type BoardContext } from "../strategy";
-import type { Board, Placements } from "../types";
+import type { Board, GameEvent, Placements } from "../types";
 import { resourcesImprovedByHarbor } from "./ports";
 import { bestEdge } from "./value";
 
@@ -290,4 +290,189 @@ export function longestRoad(graph: Map<string, Set<string>>, blocked?: Set<strin
     walk(start, start, 0);
   }
   return { len: bestLen, ends: [...ends] };
+}
+
+export type SetupStage = "first_settlement" | "first_road" | "second_settlement" | "second_road" | "setup_done";
+
+export interface OpeningRoadGuidance {
+  stage: SetupStage;
+  anchor?: string;
+  /** The one road that can be placed now. */
+  current?: { edge: string; reason: string };
+  /** Direction after this placement. Never a setup action. */
+  later?: { edge: string; reason: string };
+  explanation?: string;
+  toward?: string;
+}
+
+function ownBuildings(placements: Placements, me: string): string[] {
+  const at: string[] = [];
+  for (const [corner, owner] of placements.settlements) if (owner === me) at.push(corner);
+  for (const [corner, owner] of placements.cities) if (owner === me && !at.includes(corner)) at.push(corner);
+  return at;
+}
+
+function roadTouches(board: Board, placements: Placements, me: string, corner: string): boolean {
+  const ctx = contextFor(board);
+  for (const edge of edgesOf(ctx).values()) {
+    if (edge.a !== corner && edge.b !== corner) continue;
+    if (placements.roads.get(edge.at) === me) return true;
+  }
+  return false;
+}
+
+function edgeTouches(board: Board, edge: string, corner: string): boolean {
+  const ends = endsOf(contextFor(board), edge);
+  return Boolean(ends && (ends[0] === corner || ends[1] === corner));
+}
+
+function stageFromEvents(events: readonly GameEvent[], me: string): { stage: SetupStage; anchor?: string } | undefined {
+  const builds = events.filter((event): event is Extract<GameEvent, { type: "build" }> => event.type === "build" && event.player === me && event.setup);
+  if (!builds.length) return undefined;
+  const settlements = builds.filter((event) => event.piece === "settlement");
+  const roads = builds.filter((event) => event.piece === "road");
+  const last = builds[builds.length - 1];
+  if (last.piece === "settlement") {
+    return { stage: settlements.length <= 1 ? "first_road" : "second_road", anchor: last.at };
+  }
+  if (settlements.length >= 2 && roads.length >= settlements.length) return { stage: "setup_done" };
+  if (settlements.length === 0) return { stage: "first_settlement" };
+  if (settlements.length === 1) return { stage: "second_settlement" };
+  return { stage: "setup_done" };
+}
+
+function stageFromPlacements(board: Board, placements: Placements, me: string): { stage: SetupStage; anchor?: string } {
+  const buildings = ownBuildings(placements, me);
+  const roadCount = [...placements.roads.values()].filter((owner) => owner === me).length;
+  const unattached = buildings.filter((at) => !roadTouches(board, placements, me, at));
+  if (buildings.length === 0) return { stage: "first_settlement" };
+  if (buildings.length === 1 && unattached.length === 1) return { stage: "first_road", anchor: unattached[0] };
+  if (buildings.length === 1) return { stage: "second_settlement" };
+  if (roadCount < 2 && unattached.length === 1) return { stage: "second_road", anchor: unattached[0] };
+  if (roadCount < 2) return { stage: "second_road" };
+  return { stage: "setup_done" };
+}
+
+export function guideOpeningRoads(
+  board: Board,
+  placements: Placements,
+  me: string,
+  opts: {
+    events?: readonly GameEvent[];
+    previewFrom?: string;
+    toward?: string;
+    myTurn?: boolean;
+    rolls?: Array<{ total: number; d1?: number; d2?: number; player?: string }>;
+    aligned?: boolean;
+    myRoadLength?: number;
+    oppRoadLength?: number;
+    iHold?: boolean;
+  } = {}
+): OpeningRoadGuidance {
+  const fromEvents = opts.events ? stageFromEvents(opts.events, me) : undefined;
+  const located = fromEvents ?? stageFromPlacements(board, placements, me);
+  const stage = located.stage;
+  const anchor = located.anchor;
+  if (opts.myTurn === false) {
+    const waiting =
+      stage === "first_road" || stage === "second_road"
+        ? "Waiting. This setup road is not your placement."
+        : stage === "setup_done"
+          ? "Both setup roads are already placed. There is no setup road left to play."
+          : "Waiting. No road of yours is legal until you place the next settlement.";
+    return { stage, explanation: waiting };
+  }
+  if (stage === "setup_done") {
+    return { stage, explanation: "Both setup roads are already placed. There is no setup road left to play." };
+  }
+  if (stage === "first_road" || stage === "second_road") {
+    const owner = anchor ? placements.settlements.get(anchor) ?? placements.cities.get(anchor) : undefined;
+    const onBoard = Boolean(anchor && owner === me);
+    if (!anchor || !onBoard) {
+      return {
+        stage,
+        explanation: "The setup road has to leave the settlement you just placed. That settlement is not identified, so no road is marked."
+      };
+    }
+    const legal = listOpenEdges(board, placements, me, anchor, true).filter((edge) => edgeTouches(board, edge.edge, anchor));
+    const ranked = bestEdge(board, placements, me, { from: anchor, onlyFrom: true, maxDist: 2, rolls: opts.rolls, aligned: opts.aligned });
+    const rankedOk = ranked && legal.some((edge) => edge.edge === ranked.edge) ? ranked : undefined;
+    const chosen = rankedOk ?? legal[0];
+    if (!chosen) return { stage, anchor, explanation: "No open road leaves the settlement you just placed." };
+    const rule =
+      stage === "first_road"
+        ? "First setup road. It has to leave the settlement you just placed."
+        : "Second setup road. It has to leave the second settlement. Extending the first road is not legal during setup.";
+    const later =
+      rankedOk?.follow && rankedOk.follow !== chosen.edge && !legal.some((edge) => edge.edge === rankedOk.follow)
+        ? {
+            edge: rankedOk.follow,
+            reason:
+              "Not this placement. The next road toward that settlement comes after setup. Setup allows only the one road touching the settlement you just placed."
+          }
+        : undefined;
+    return {
+      stage,
+      anchor,
+      toward: rankedOk?.toward,
+      current: { edge: chosen.edge, reason: `${rule} ${rankedOk?.reason ?? "This is an open edge off that settlement."}` },
+      later
+    };
+  }
+  const explanation =
+    stage === "first_settlement"
+      ? "No road is legal yet. Place the first settlement first. Its setup road then has to leave that settlement."
+      : "No road is legal yet. Place the second settlement first. Its setup road has to leave that settlement, not extend the first road.";
+  const previewOwner = opts.previewFrom ? placements.settlements.get(opts.previewFrom) ?? placements.cities.get(opts.previewFrom) : undefined;
+  const preview =
+    opts.previewFrom && (!previewOwner || previewOwner === me)
+      ? adviseRoad(board, placements, me, {
+          from: opts.previewFrom,
+          onlyFrom: true,
+          toward: opts.toward,
+          maxDist: 2,
+          myRoadLength: opts.myRoadLength,
+          oppRoadLength: opts.oppRoadLength,
+          iHold: opts.iHold
+        })
+      : undefined;
+  const later =
+    preview && opts.previewFrom && edgeTouches(board, preview.edge, opts.previewFrom)
+      ? {
+          edge: preview.edge,
+          reason: `Not this placement. After the settlement is placed, this is the setup road to consider. ${preview.reason}`
+        }
+      : undefined;
+  return { stage, explanation, later };
+}
+
+export function displayRoadAdvice(args: {
+  opening: boolean;
+  guidance: OpeningRoadGuidance;
+  turnRoad?: { edge: string; reason: string };
+  history?: string;
+  emptyReason?: string;
+}): {
+  current?: { edge: string; title: string; reason: string };
+  later?: { edge: string; reason: string };
+  sections: Array<{ title: string; lines: string[] }>;
+} {
+  const sections: Array<{ title: string; lines: string[] }> = [];
+  if (args.history) sections.push({ title: "Setup context", lines: [args.history] });
+  if (!args.opening) {
+    if (args.turnRoad) return { current: { edge: args.turnRoad.edge, title: "Next road", reason: args.turnRoad.reason }, sections };
+    sections.unshift({ title: "Road", lines: [args.emptyReason ?? "No road to place on this turn."] });
+    return { sections };
+  }
+  if (args.guidance.later) sections.push({ title: "Not this placement", lines: [args.guidance.later.reason] });
+  if (args.guidance.current) {
+    const title = args.guidance.stage === "second_road" ? "Second setup road" : "First setup road";
+    return {
+      current: { edge: args.guidance.current.edge, title, reason: args.guidance.current.reason },
+      later: args.guidance.later,
+      sections
+    };
+  }
+  sections.unshift({ title: "Road", lines: [args.guidance.explanation ?? "No road is legal on this placement."] });
+  return { later: args.guidance.later, sections };
 }

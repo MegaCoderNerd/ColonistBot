@@ -2,8 +2,8 @@
 import { coachedOpening } from "../analyzer/engine/opening";
 import { buildHints, miniMapSvg, placementsFrom, robberTargets, type MapMark } from "../analyzer/advisor";
 import { coachFromOpening, type CoachAdvice } from "../analyzer/engine/actions";
-import { adviseRoad, listOpenEdges, roadToward } from "../analyzer/engine/roads";
-import { bestEdge, nextRollText, positionWin, sevensText } from "../analyzer/engine/value";
+import { displayRoadAdvice, guideOpeningRoads, roadToward } from "../analyzer/engine/roads";
+import { nextRollText, positionWin, sevensText } from "../analyzer/engine/value";
 import { bagAligned } from "../analyzer/engine/read";
 import { planTurn, type TurnPlan } from "../analyzer/engine/decide";
 import { evaluateCandidatesShadow, type ShadowEvaluationReport, type ShadowRolloutConfig } from "../analyzer/engine/shadow";
@@ -80,6 +80,7 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
   let behindSince = 0;
   let planMemo: { key: string; plan: OpeningPlan } | undefined;
   let midMemo: { key: string; plan: TurnPlan } | undefined;
+  let setupMemory: { edge: string; reason: string } | undefined;
 
   function feed(frame: WsFrame) {
     if (frame.dir !== "in") return;
@@ -343,29 +344,27 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
       lines.push(plan.note);
       const follow = picks[0]?.followUp;
       const placing = picks[0]?.at;
-      const secondSpot = plan.mode === "pair" && mine === 0 ? follow?.at : undefined;
       const closeSecond = follow && placing && mine === 0 && plan.mode !== "pair" ? roadToward(board, placements, who.id, follow.at, placing) : undefined;
-      const road = placing
-        ? adviseRoad(board, placements, who.id, {
-            from: placing,
-            onlyFrom: true,
-            toward: closeSecond && closeSecond.dist <= 2 ? follow!.at : undefined,
-            maxDist: 2,
-            myRoadLength: result.snapshot?.players.find((p) => p.id === who.id)?.roadLength,
-            oppRoadLength: result.snapshot?.players.find((p) => p.id !== who.id)?.roadLength,
-            iHold: result.snapshot?.players.find((p) => p.id === who.id)?.hasLongestRoad
-          })
-        : undefined;
-      const secondRoad = secondSpot ? adviseRoad(board, placements, who.id, { from: secondSpot, onlyFrom: true, maxDist: 2 }) : undefined;
       const rolls = result.events.flatMap((e) => (e.type === "roll" ? [{ total: e.total, d1: e.d1, d2: e.d2, player: e.player }] : []));
       const aligned = bagAligned(result.snapshot?.completedTurns, rolls.length);
-      const edgePick = placing ? bestEdge(board, placements, who.id, { from: placing, onlyFrom: true, maxDist: 2, rolls, aligned }) : undefined;
-      let setupRoad = road;
-      if (!setupRoad && edgePick) setupRoad = { edge: edgePick.edge, toward: edgePick.toward, reason: `Point this road toward your second spot. ${edgePick.reason}` };
-      if (!setupRoad && placing) {
-        const open = listOpenEdges(board, placements, who.id, placing, true)[0];
-        if (open) setupRoad = { edge: open.edge, toward: open.to, reason: "This road leaves the settlement you are placing." };
-      }
+      const guidance = guideOpeningRoads(board, placements, who.id, {
+        events: result.events,
+        previewFrom: myTurn === false ? undefined : placing,
+        toward: closeSecond && closeSecond.dist <= 2 ? follow!.at : undefined,
+        myTurn,
+        rolls,
+        aligned,
+        myRoadLength: result.snapshot?.players.find((p) => p.id === who.id)?.roadLength,
+        oppRoadLength: result.snapshot?.players.find((p) => p.id !== who.id)?.roadLength,
+        iHold: result.snapshot?.players.find((p) => p.id === who.id)?.hasLongestRoad
+      });
+      if (guidance.stage === "first_settlement") setupMemory = undefined;
+      if (guidance.current) setupMemory = { edge: guidance.current.edge, reason: guidance.current.reason };
+      const setupHistory =
+        setupMemory && placements.roads.get(setupMemory.edge) === who.id && guidance.current?.edge !== setupMemory.edge
+          ? `Already placed, not an action. ${setupMemory.reason}`
+          : undefined;
+      const shown = displayRoadAdvice({ opening: true, guidance, history: setupHistory });
       const myView = views.find((v) => v.name === who.logName);
       const handKnown = Boolean(myView && (myView.exact || (myView.unknown === 0 && myView.total > 0)));
       const hand = handKnown ? myView?.hand : undefined;
@@ -390,7 +389,18 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
         held > limit
           ? `You hold ${held} cards. Drop ${Math.floor(held / 2)} if a 7 comes before you can spend them. ${sevensText(rolls, aligned, who.id)}`
           : `${sevensText(rolls, aligned, who.id)}${held >= limit - 2 && held > 0 ? ` You hold ${held}, close to the discard of ${limit}.` : ""}`;
-      coach = coachFromOpening(plan, nextHarbor ? describePortTarget(nextHarbor) : undefined, { first: setupRoad?.reason, second: secondRoad?.reason });
+      coach = coachFromOpening(plan, nextHarbor ? describePortTarget(nextHarbor) : undefined, {
+        first: guidance.current?.reason,
+        later: guidance.later?.reason
+      });
+      if (guidance.current) {
+        coach = {
+          ...coach,
+          headline: guidance.stage === "second_road" ? "Place the second setup road." : "Place the first setup road.",
+          why: guidance.current.reason,
+          at: guidance.anchor
+        };
+      }
       coach = {
         ...coach,
         race: `About ${pct}% from here. ${next}`,
@@ -401,8 +411,15 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
           ...coach.tips
         ]
       };
-      lines.push(...(picks.length ? picks.map((c, i) => `${i + 1}. ${c.reason}`) : plan.mode === "waiting" ? [] : ["No legal spot found."]));
-      if (follow) {
+      const roadStage = guidance.stage === "first_road" || guidance.stage === "second_road";
+      if (roadStage) {
+        lines.push(guidance.stage === "second_road" ? "This placement is the second setup road." : "This placement is the first setup road.");
+        if (picks[0]) sections.push({ title: "Later settlement", lines: [`Not this placement. ${picks[0].reason}`] });
+        picks = [];
+      } else {
+        lines.push(...(picks.length ? picks.map((c, i) => `${i + 1}. ${c.reason}`) : plan.mode === "waiting" ? [] : ["No legal spot found."]));
+      }
+      if (follow && !roadStage) {
         lines.push(plan.mode === "pair" && mine === 0 ? `Second settlement: ${follow.reason}` : `+ Then: ${follow.reason}`);
         marks.push({ at: follow.at, label: "+", kind: "follow" });
       }
@@ -415,17 +432,14 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
         if (weak.length) sections.push({ title: "Weak points", lines: weak });
       }
       lines.push("W wood, B brick, S sheep, G wheat, O ore.");
-      if (setupRoad) {
-        sections.unshift({ title: plan.mode === "pair" && secondRoad ? "First road" : "Next road", lines: [setupRoad.reason] });
-        marks.push({ at: setupRoad.edge, label: secondRoad ? "1" : "R", kind: "road" });
+      const setupContext = shown.sections.filter((section) => section.title === "Setup context");
+      const roadNotes = shown.sections.filter((section) => section.title !== "Setup context");
+      sections.unshift(...roadNotes);
+      if (shown.current) {
+        sections.unshift({ title: shown.current.title, lines: [shown.current.reason] });
+        marks.push({ at: shown.current.edge, label: "R", kind: "road" });
       }
-      if (secondRoad) {
-        sections.splice(setupRoad ? 1 : 0, 0, { title: "Second road", lines: [secondRoad.reason] });
-        marks.push({ at: secondRoad.edge, label: "2", kind: "road" });
-      }
-      if (edgePick?.follow && setupRoad && setupRoad.edge === edgePick.edge && edgePick.follow !== setupRoad.edge && !secondRoad) {
-        marks.push({ at: edgePick.follow, label: "", kind: "road", later: true });
-      }
+      sections.push(...setupContext);
     } else {
       const myView = views.find((v) => v.name === who.logName);
       if (myView) lines.push(...buildHints(myView));
@@ -524,15 +538,29 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
         });
       }
       if (plan.weaknesses.length) sections.push({ title: "Weak points", lines: plan.weaknesses });
-      if (turn.road) {
+      const setupHistory =
+        setupMemory && placements.roads.get(setupMemory.edge) === who.id
+          ? `Already placed, not an action. ${setupMemory.reason}`
+          : undefined;
+      const shown = displayRoadAdvice({
+        opening: false,
+        guidance: { stage: "setup_done" },
+        turnRoad: turn.road ? { edge: turn.road.edge, reason: turn.road.reason } : undefined,
+        history: setupHistory,
+        emptyReason: `No road to place on this turn. ${turn.headline}`
+      });
+      if (shown.current) {
         const pair = Boolean(turn.road2);
-        sections.unshift({ title: pair ? "First road" : "Next road", lines: [turn.road.reason] });
-        marks.push({ at: turn.road.edge, label: pair ? "1" : "R", kind: "road" });
+        sections.unshift({ title: pair ? "First road" : shown.current.title, lines: [shown.current.reason] });
+        marks.push({ at: shown.current.edge, label: pair ? "1" : "R", kind: "road" });
+      } else {
+        sections.unshift(...shown.sections.filter((section) => section.title !== "Setup context"));
       }
       if (turn.road2) {
         sections.splice(1, 0, { title: "Second road", lines: [turn.road2.reason] });
         marks.push({ at: turn.road2.edge, label: "2", kind: "road" });
       }
+      sections.push(...shown.sections.filter((section) => section.title === "Setup context"));
       if (turn.roadLater && !turn.road2) marks.push({ at: turn.roadLater.edge, label: "", kind: "road", later: true });
       if (!lines.length && !sections.length) lines.push("Nothing to suggest right now.");
     }
@@ -569,6 +597,7 @@ export function createHelper(friendlyBelow = 3, options?: HelperOptions) {
       behindSince = 0;
       planMemo = undefined;
       midMemo = undefined;
+      setupMemory = undefined;
       placements = placementsFrom([]);
     }
   };

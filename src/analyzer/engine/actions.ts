@@ -17,13 +17,14 @@ export interface CoachAdvice {
   next: string[];
 }
 
-export function coachFromOpening(plan: OpeningPlan, portLine?: string, roads?: { first?: string; second?: string }): CoachAdvice {
+export function coachFromOpening(plan: OpeningPlan, portLine?: string, roads?: { first?: string; second?: string; later?: string }): CoachAdvice {
   const top = plan.picks[0];
   const follow = top?.followUp;
   const here = top ? `${top.numbers.join("/")} (${top.pips} pips)` : "the spot";
   const tips: CoachTip[] = [];
   if (roads?.first) tips.push({ title: plan.mode === "pair" ? "First road" : "Road", why: roads.first });
   if (roads?.second) tips.push({ title: "Second road", why: roads.second });
+  if (roads?.later) tips.push({ title: "Not this placement", why: roads.later });
   if (portLine) tips.push({ title: "Ports", why: portLine });
   if (top?.tags?.some((t) => /his best|blocks his|#\d/.test(t))) {
     tips.push({ title: "Denial", why: "One of these spots is also a spot he wants. Taking it is worth more than a slightly higher pip count somewhere he cannot reach." });
@@ -35,15 +36,15 @@ export function coachFromOpening(plan: OpeningPlan, portLine?: string, roads?: {
     why = plan.oppWants[0] ? `He is likely to take ${plan.oppWants[0].reason}` : plan.note;
   } else if (plan.mode === "pair" && top && follow) {
     headline = `First, settle ${here}. Then settle ${follow.reason.replace(/\.$/, "")}.`;
-    why = `You place both now, in that order. The first road leaves the first settlement. The second road leaves the second settlement. Do not point either road across the board at the other starting spot.`;
+    why = `You place both now, in that order. After each settlement, one road leaves that settlement. The second road does not extend the first.`;
   } else if (plan.mode === "first" && top && follow) {
     headline = `Settle ${here} now.`;
-    why = `He places twice before you come back. The road below leaves this settlement. Come back for ${follow.reason.replace(/\.$/, "")} if he has not taken it.`;
+    why = `He places twice before you come back. After this settlement, the setup road leaves it. Come back for ${follow.reason.replace(/\.$/, "")} if he has not taken it.`;
   } else if (plan.mode === "second" && top) {
     headline = `Second settlement: ${here}.`;
     why = follow
-      ? `Place this one now. It is still your turn. The road below leaves this settlement, not the one you just placed. The other spot was ${follow.reason.replace(/\.$/, "")}.`
-      : "Place this one now. It is still your turn. The road below leaves this settlement.";
+      ? `Place this settlement now. After it is down, the one setup road must leave it. The other spot was ${follow.reason.replace(/\.$/, "")}.`
+      : "Place this settlement now. After it is down, the one setup road must leave it.";
   } else if (top) {
     headline = `Settle ${here}.`;
     why = plan.mode === "last" ? `This is your second settlement. He has already placed both of his. ${plan.note}` : plan.note;

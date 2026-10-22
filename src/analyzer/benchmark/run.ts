@@ -24,6 +24,8 @@ import {
   type BenchmarkCorpus
 } from "./corpus";
 import { buildAllSyntheticFixtures } from "./fixtures";
+import { buildGeneratedOpening } from "./generated-board";
+import { runCrossPlay, type CrossPlayReport } from "./crossplay";
 import { buildTacticalCases } from "./tactical";
 import {
   comparePoliciesPaired,
@@ -71,6 +73,7 @@ export interface BenchmarkReport {
   readonly pairedComparisons: readonly PairedPolicyComparison[];
   readonly budgetStability: readonly BudgetStabilityResult[];
   readonly syntheticPositionsUsed: readonly string[];
+  readonly crossPlay?: CrossPlayReport;
   readonly knownLimitations: readonly string[];
   readonly summary: string;
 }
@@ -87,7 +90,13 @@ const KNOWN_LIMITATIONS: readonly string[] = [
   "Tactical pass rates cover only rule-proven and constructed-scenario-proven cases. Positions with multiple valid choices or no established answer are reported as informational and never counted as failures.",
   "Balanced Dice models are provisional empirical approximations (isExact: false), not exact reproductions of proprietary Colonist server code. Colonist 1v1 per-player seven-streak balancing is not modeled.",
   "Positions from the same recording are grouped by recording ID and must never be split across evaluation folds; a recording is not an independent sample per frame.",
-  "Stage 3.5 is an experimental evaluation milestone. Shadow mode remains disabled by default and no production recommendation, score, advice text, opening pick, or map target is changed by this harness."
+  "Stage 3.5 is an experimental evaluation milestone. Shadow mode remains disabled by default and no production recommendation, score, advice text, opening pick, or map target is changed by this harness.",
+  "Generated cross-play uses the rules engine from setup on a seeded standard 19-hex board. It does not require a Colonist recording. The board is not an official Colonist map seed.",
+  "Cross-play win rates use completed games only. Turn and action cutoffs are counted separately and are not wins, losses, or draws.",
+  "Inside a simulated game each policy uses its own hand. The settlement-race clock still uses the opponent's public hand size and production, not the hidden card types in that sample.",
+  "Domestic player trades stay disabled. Balanced dice are an approximation. Development cards, the robber, and bank trades follow the implemented rules and can still differ from Colonist.",
+  "A Wilson interval on a small completed-game count is uncertainty, not statistical significance, and not evidence of professional strength.",
+  "baseline_heuristic_v1 is the race-aware heuristic. baseline_distance_only_v1 is that same heuristic with the race penalty off. They are compared because the road rule differs. The settlement racer, development policy, longest-road policy, and random legal policy use different action orders."
 ];
 
 
@@ -112,9 +121,10 @@ export function runBenchmark(options: BenchmarkRunOptions): BenchmarkReport {
   // 2. Build synthetic fixtures. These ALWAYS run so the tactical suite is never empty, and every
   //    synthetic position is labelled as such in the report.
   const seedRecording = recordings.length > 0 ? recordings[0] : undefined;
+  const generatedOpening = buildGeneratedOpening(String(baseSeed));
   const seedObserved = seedRecording
     ? buildObservedFromRecording(seedRecording)?.observed
-    : undefined;
+    : generatedOpening.observed;
 
   const syntheticPositions: BenchmarkPosition[] = [];
   const tacticalSuites: TacticalSuiteResult[] = [];
@@ -175,6 +185,16 @@ export function runBenchmark(options: BenchmarkRunOptions): BenchmarkReport {
     }
   }
 
+  const crossPlay = runCrossPlay({
+    topology: generatedOpening.topology,
+    seed: baseSeed,
+    trials: numTrials,
+    victoryPointsToWin: 10,
+    maxTurns: options.maxTurnsPerRollout ?? 70,
+    maxActions: options.maxActionsPerRollout ?? 450,
+    highNumbersTouch: generatedOpening.highNumbersTouch
+  });
+
   return {
     generatedAtIso: new Date().toISOString(),
     nodeVersion: process.version,
@@ -187,6 +207,7 @@ export function runBenchmark(options: BenchmarkRunOptions): BenchmarkReport {
     pairedComparisons,
     budgetStability,
     syntheticPositionsUsed: syntheticPositions.map((p) => p.positionId),
+    crossPlay,
     knownLimitations: KNOWN_LIMITATIONS,
     summary: buildSummary({
       corpus,
@@ -195,7 +216,8 @@ export function runBenchmark(options: BenchmarkRunOptions): BenchmarkReport {
       pairedComparisons,
       budgetStability,
       syntheticCount: syntheticPositions.length,
-      numTrials
+      numTrials,
+      crossPlay
     })
   };
 }
@@ -232,6 +254,7 @@ function buildSummary(args: {
   budgetStability: readonly BudgetStabilityResult[];
   syntheticCount: number;
   numTrials: number;
+  crossPlay?: CrossPlayReport;
 }): string {
   const lines: string[] = [];
   lines.push("Stage 3.5 policy evaluation summary");
@@ -241,9 +264,23 @@ function buildSummary(args: {
   );
   if (args.corpus.coverage.reducedCoverage) {
     lines.push(
-      "- REDUCED COVERAGE: no recording dataset was available, so empirical policy comparison " +
-        "could not run. Only the synthetic tactical suite and any synthetic budget sweep are reported."
+      "- REDUCED RECORDED COVERAGE: no recording dataset was available, so recorded-position " +
+        "comparison did not run. Generated-board cross-play still ran."
     );
+  }
+  if (args.crossPlay) {
+    lines.push(
+      `- Cross-play: ${args.crossPlay.matchups.length} seat matchup(s), ` +
+        `${args.crossPlay.trialsPerSeat} trial(s) per seat, first to ${args.crossPlay.victoryPointsToWin} VP.`
+    );
+    for (const matchup of args.crossPlay.matchups) {
+      const rate = matchup.winRateAmongCompleted === null ? "n/a" : `${(matchup.winRateAmongCompleted * 100).toFixed(1)}%`;
+      lines.push(
+        `  - ${matchup.focusPolicyId} as ${matchup.focusPlayerId} vs ${matchup.opponentPolicyId}: ` +
+          `completed ${matchup.completed}/${matchup.trials} (wins ${matchup.wins}, losses ${matchup.losses}, draws ${matchup.draws}, ` +
+          `cutoffs ${matchup.cutoffs}, failures ${matchup.failures}), win rate ${rate}. ${matchup.establishes}`
+      );
+    }
   }
 
   for (const suite of args.tacticalSuites) {
@@ -345,8 +382,8 @@ export function formatReport(report: BenchmarkReport): string {
   }
   if (report.coverage.reducedCoverage) {
     out.push("");
-    out.push("!! REDUCED EVALUATION COVERAGE: the recording dataset was unavailable.");
-    out.push("!! Empirical win-rate comparisons are omitted; only deterministic synthetic cases ran.");
+    out.push("!! REDUCED RECORDED COVERAGE: the recording dataset was unavailable.");
+    out.push("!! Recorded-position comparison did not run. Generated-board cross-play is reported below.");
   }
 
   out.push("");
@@ -408,6 +445,43 @@ export function formatReport(report: BenchmarkReport): string {
       out.push(
         `  ${c.policyBId} vs ${c.policyAId}: ${c.classification} (p=${p}, paired n=${c.pairedCompletedTrials})`
       );
+    }
+  }
+
+  out.push("");
+  out.push(`-- Generated cross-play ${"-".repeat(54)}`);
+  if (!report.crossPlay) {
+    out.push("Cross-play did not run.");
+  } else {
+    out.push(
+      `Seed ${report.crossPlay.seed}. First to ${report.crossPlay.victoryPointsToWin} VP. ` +
+        `${report.crossPlay.trialsPerSeat} trial(s) from each seat. ` +
+        `High-number tokens touch: ${report.crossPlay.highNumbersTouch ? "yes" : "no"}.`
+    );
+    out.push("Wins use completed games only. Cutoffs are not wins or losses.");
+    out.push("This does not establish professional strength.");
+    for (const matchup of report.crossPlay.matchups) {
+      const rate = matchup.winRateAmongCompleted === null ? "n/a" : `${(matchup.winRateAmongCompleted * 100).toFixed(1)}%`;
+      const ci = matchup.wilson95
+        ? ` Wilson95 ${(matchup.wilson95.lower * 100).toFixed(1)}-${(matchup.wilson95.upper * 100).toFixed(1)}%`
+        : "";
+      const margin = matchup.meanVpMarginAmongCompleted === null ? "n/a" : matchup.meanVpMarginAmongCompleted.toFixed(2);
+      const turns = matchup.meanTurnsAmongCompleted === null ? "n/a" : matchup.meanTurnsAmongCompleted.toFixed(1);
+      const city = matchup.meanFirstCityTurn === null ? "n/a" : matchup.meanFirstCityTurn.toFixed(1);
+      out.push(
+        `${matchup.focusPolicyId} as ${matchup.focusPlayerId} vs ${matchup.opponentPolicyId}: ` +
+          `completed ${matchup.completed}/${matchup.trials} W${matchup.wins} L${matchup.losses} D${matchup.draws} ` +
+          `cutoff ${matchup.cutoffs} fail ${matchup.failures} win ${rate}${ci}`
+      );
+      out.push(
+        `  VP margin ${margin} | turns ${turns} | focus VP ${matchup.meanFocusVpAmongCompleted === null ? "n/a" : matchup.meanFocusVpAmongCompleted.toFixed(2)} ` +
+          `| main settlements ${matchup.meanMainSettlements === null ? "n/a" : matchup.meanMainSettlements.toFixed(2)} ` +
+          `| dead-end roads ${matchup.meanDeadEndRoads === null ? "n/a" : matchup.meanDeadEndRoads.toFixed(2)} ` +
+          `| roads into an opponent ${matchup.meanBlockedRoads === null ? "n/a" : matchup.meanBlockedRoads.toFixed(2)} ` +
+          `| first city turn ${city} | discards ${matchup.meanDiscards === null ? "n/a" : matchup.meanDiscards.toFixed(2)} ` +
+          `| longest road ${matchup.longestRoadGames} | largest army ${matchup.largestArmyGames} | ${matchup.elapsedMs.toFixed(0)}ms`
+      );
+      out.push(`  ${matchup.establishes}`);
     }
   }
 

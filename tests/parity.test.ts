@@ -71,7 +71,8 @@ const STAGE_2_AND_3_MODIFIED_MODULES = new Set([
   "// src/analyzer/engine/ports.ts",
   "// src/analyzer/strategy.ts",
   "// src/analyzer/engine/value.ts",
-  "// src/analyzer/engine/read.ts"
+  "// src/analyzer/engine/read.ts",
+  "// src/analyzer/engine/actions.ts"
 ]);
 
 const STAGE_3_NEW_MODULES = new Set([
@@ -161,12 +162,14 @@ describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () =>
     expect(simMod).toContain("endTurn");
     expect(simMod).toContain('"monopoly"');
 
-    // Live extension helper.ts calls adviseRoad, listOpenEdges, bestEdge, and planTurn
+    // Live extension helper.ts calls guideOpeningRoads, which scores with adviseRoad, listOpenEdges, and bestEdge, plus planTurn
     const helperMod = builtMods.get("// src/extension/helper.ts")!;
-    expect(helperMod).toContain("adviseRoad(");
-    expect(helperMod).toContain("listOpenEdges(");
-    expect(helperMod).toContain("bestEdge(");
+    expect(helperMod).toContain("guideOpeningRoads(");
     expect(helperMod).toContain("planTurn(");
+    expect(roadsMod).toContain("guideOpeningRoads(");
+    expect(roadsMod).toContain("listOpenEdges(");
+    expect(roadsMod).toContain("bestEdge(");
+    expect(roadsMod).toContain("adviseRoad(");
 
     // Advisory-only check: content.js has zero WebSocket send calls, and inject.js only forwards nativeSend.call(this, data)
     expect(builtContent).not.toContain(".send(");

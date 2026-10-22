@@ -7,10 +7,25 @@ import { RESOURCES, type ResourceBag, type ResourceHand } from "../types";
  */
 export const RACE_EVALUATOR_ID = "settlement_race_v1";
 
-const LOST_PENALTY = 12;
-const UNCERTAIN_PENALTY = 1.5;
-const URGENT_BONUS = 1.5;
-const PORT_INCREMENT = 1.6;
+/**
+ * Score offsets applied after the race is judged.
+ * `portIncrement` is recorded on the assessment and is not added to `adjustment`.
+ * Spot and edge scorers already apply harbor value once.
+ */
+export interface RaceWeights {
+  readonly lostPenalty: number;
+  readonly uncertainPenalty: number;
+  readonly urgentBonus: number;
+}
+
+export const DEFAULT_RACE_WEIGHTS: RaceWeights = {
+  lostPenalty: 12,
+  uncertainPenalty: 1.5,
+  urgentBonus: 1.5
+};
+
+/** Reported for an improving harbor. No current scorer adds this number. */
+export const RACE_PORT_INCREMENT = 1.6;
 
 export interface RaceQuery {
   /** Additional roads the player still has to build. Owned edges are already zero. */
@@ -34,6 +49,8 @@ export interface RaceQuery {
   weActFirst?: boolean;
   myRoadsLeft?: number;
   opponentRoadsLeft?: number;
+  /** Omitted weights are the live-coach defaults. */
+  weights?: RaceWeights;
 }
 
 export type RaceCertainty = "known" | "production" | "uncertain" | "none";
@@ -138,7 +155,8 @@ export function assessSettlementRace(input: RaceQuery): RaceAssessment {
   const unknown = Math.max(0, input.opponentUnknown ?? 0);
   const fullyKnown = cardsSpecified && unknown === 0;
   const weActFirst = input.weActFirst !== false;
-  const incrementalPort = input.portImproves ? PORT_INCREMENT : 0;
+  const weights = input.weights ?? DEFAULT_RACE_WEIGHTS;
+  const incrementalPort = input.portImproves ? RACE_PORT_INCREMENT : 0;
 
   let myTurns = myHandKnown ? finishTurns(input.myRoads, myHand, input.myProduction, myRates) : input.myRoads;
   if (input.myRoadsLeft !== undefined && input.myRoadsLeft < input.myRoads) myTurns = Infinity;
@@ -181,9 +199,9 @@ export function assessSettlementRace(input: RaceQuery): RaceAssessment {
   const deadEnd = Boolean(input.soleAccess && (lost || (myHandKnown && !Number.isFinite(myTurns))));
 
   let adjustment = 0;
-  if (lost) adjustment -= LOST_PENALTY;
-  else if (possibleThreat) adjustment -= UNCERTAIN_PENALTY;
-  else if (urgent) adjustment += URGENT_BONUS;
+  if (lost) adjustment -= weights.lostPenalty;
+  else if (possibleThreat) adjustment -= weights.uncertainPenalty;
+  else if (urgent) adjustment += weights.urgentBonus;
 
   let reason = "No one else can take this settlement first.";
   if (lost) reason = "He can pay for that settlement before you can.";

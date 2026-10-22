@@ -1,6 +1,6 @@
 import { RESOURCES, type Resource, type ResourceBag, type ResourceHand } from "../types";
 import { resourcesImprovedByHarbor } from "./ports";
-import { assessSettlementRace, type RaceAssessment } from "./race";
+import { assessSettlementRace, type RaceAssessment, type RaceWeights } from "./race";
 import {
   sampleDeterminization,
   type DeterminizationDiagnostics,
@@ -87,6 +87,11 @@ export interface RolloutOptions {
   readonly diceAlignmentStatus?: ObservedDiceState["alignmentStatus"];
   /** Policy used to select among legal actions. Defaults to ` baselineRolloutPolicy`. */
   readonly policy?: RolloutPolicy;
+  /**
+   * Per-seat policies for cross-play. A seat missing from this map uses `policy`.
+   * Each policy still sees only that seat's own hand. Opponent card types stay hidden.
+   */
+  readonly policiesByPlayerId?: Readonly<Record<string, RolloutPolicy>>;
   /** Options forwarded to `getLegalActions`. */
   readonly legalActionOptions?: LegalActionOptions;
   /** Whether to run `validateConcreteSimState` after every transition step. Default: true. */
@@ -111,6 +116,8 @@ export interface RolloutResult {
   readonly finalState: ConcreteSimulatedGameState;
   readonly initialSeed: number;
   readonly policyId: string;
+  /** Present when each seat used its own policy. Absent for the single-policy default. */
+  readonly seatPolicyIds?: readonly string[];
   readonly diceModelId: DiceModelId;
   readonly diceModelStatus: DiceModelStatus;
   readonly diceModelIsExact: boolean;
@@ -360,10 +367,19 @@ function roadsFromPlayer(state: ConcreteSimulatedGameState, playerId: string, go
 }
 
 /**
- * Race against observed roads and public production. The opponent's card types stay
- * unknown: only the public hand size is passed, never the hidden resources.
+ * Race against observed roads and public production.
+ *
+ * The acting player uses that player's own hand. The opponent's card types stay hidden
+ * even inside a concrete sample: only the public hand size is passed. Treating the
+ * sample's resources as known would leak a different hidden hand into every world.
  */
-function raceToCorner(state: ConcreteSimulatedGameState, actorId: string, cornerIndex: number, myRoads: number): RaceAssessment {
+function raceToCorner(
+  state: ConcreteSimulatedGameState,
+  actorId: string,
+  cornerIndex: number,
+  myRoads: number,
+  weights?: RaceWeights
+): RaceAssessment {
   const actor = state.players.find((player) => player.id === actorId);
   let closest: { roads: number; playerId: string } | undefined;
   for (const player of state.players) {
@@ -387,7 +403,8 @@ function raceToCorner(state: ConcreteSimulatedGameState, actorId: string, corner
     portImproves: Boolean(corner?.port && actor && resourcesImprovedByHarbor(actor.ratios, corner.port).length > 0),
     myRoadsLeft: actor?.roadsLeft,
     opponentRoadsLeft: opponent?.roadsLeft,
-    weActFirst: true
+    weActFirst: true,
+    ...(weights ? { weights } : {})
   });
 }
 
@@ -396,10 +413,11 @@ function raceScore(
   actorId: string,
   reach: { dist: number; cornerIndex?: number },
   base: number,
-  trophy: boolean
+  trophy: boolean,
+  weights?: RaceWeights
 ): { score: number; lost: boolean } {
   if (reach.cornerIndex === undefined || reach.dist >= 99) return { score: base, lost: false };
-  const race = raceToCorner(state, actorId, reach.cornerIndex, reach.dist + 1);
+  const race = raceToCorner(state, actorId, reach.cornerIndex, reach.dist + 1, weights);
   return { score: base + race.adjustment, lost: race.lost && !trophy };
 }
 
@@ -465,8 +483,14 @@ function selectBankTradeForTarget(
  * - Uses only public board information and `actorId`'s own hand/devs (never peeks at opponent hands or `devDeckOrder`).
  * - Prevents aimless road spam and bank-trade loops so rollouts make forward VP progress and terminate reliably.
  */
-export const baselineRolloutPolicy: RolloutPolicy = {
-  id: "baseline_heuristic_v1",
+export function createHeuristicRolloutPolicy(
+  id: string,
+  raceAware: boolean,
+  weights?: RaceWeights,
+  partialCityTrades = false
+): RolloutPolicy {
+  return {
+  id,
 
   selectAction(
     state: ConcreteSimulatedGameState,
@@ -508,7 +532,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         const scored = roadActions.map((action) => {
           const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 2);
           const base = (3 - Math.min(3, reach.dist)) * 5 + reach.bestCornerScore * 0.2;
-          const raced = raceScore(state, actorId, reach, base, false);
+          const raced = raceAware ? raceScore(state, actorId, reach, base, false, weights) : { score: base, lost: false };
           return { action, score: raced.score, lost: raced.lost };
         });
         const open = scored.filter((row) => !row.lost);
@@ -603,7 +627,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
           nextEdgeOwner[action.edgeIndex] = actorId;
           const lenGain = Math.max(0, computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId) - actor.roadLength);
           const base = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 2.5;
-          const raced = raceScore(state, actorId, reach, base, lenGain > 0);
+          const raced = raceAware ? raceScore(state, actorId, reach, base, lenGain > 0, weights) : { score: base, lost: false };
           return { action, score: raced.score, lost: raced.lost && lenGain === 0 };
         });
         const open = scored.filter((row) => !row.lost);
@@ -667,7 +691,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         if (bankTrades.length > 0 && context.bankTradesThisTurn < 4) {
           const overDiscardLimit = sumHand(actor.hand) > state.rules.cardDiscardLimit;
           if (canCity) {
-            const trade = selectBankTradeForTarget(actor, COST_CITY, bankTrades, overDiscardLimit);
+            const trade = selectBankTradeForTarget(actor, COST_CITY, bankTrades, partialCityTrades || overDiscardLimit);
             if (trade) return trade;
           }
           if (canSettleNow) {
@@ -708,7 +732,7 @@ export const baselineRolloutPolicy: RolloutPolicy = {
               if (needsExpansionRoad && reach.dist > 3 && lenGain === 0) continue;
               const trophy = contestingLongestRoad && lenGain > 0;
               const base = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lenGain * 4;
-              const raced = raceScore(state, actorId, reach, base, trophy);
+              const raced = raceAware ? raceScore(state, actorId, reach, base, trophy, weights) : { score: base, lost: false };
               scored.push({ action, score: raced.score, keep: trophy || !raced.lost });
             }
             const open = scored.filter((row) => row.keep);
@@ -735,7 +759,17 @@ export const baselineRolloutPolicy: RolloutPolicy = {
         return rng.pick(legalActions);
     }
   }
-};
+  };
+}
+
+/** Race-aware production heuristic. Live rollout and shadow keep this policy. */
+export const baselineRolloutPolicy = createHeuristicRolloutPolicy("baseline_heuristic_v1", true);
+
+/**
+ * Previous road rule: the same heuristic with the settlement-race penalty turned off.
+ * Benchmark-only. It is not the live coach.
+ */
+export const baselineDistanceOnlyRolloutPolicy = createHeuristicRolloutPolicy("baseline_distance_only_v1", false);
 
 function pickBestYearOfPlentyAction(
   state: ConcreteSimulatedGameState,
@@ -866,9 +900,13 @@ export function runRollout(
     ? createSeededRng(deriveTrialSeed(rng.initialSeed, 0, "rollout-policy"))
     : rng;
 
+  const seatPolicyIds = options?.policiesByPlayerId
+    ? Object.entries(options.policiesByPlayerId).map(([playerId, seatPolicy]) => `${playerId}:${seatPolicy.id}`)
+    : undefined;
   const baseResultFields = {
     initialSeed: rng.initialSeed,
     policyId: policy.id,
+    ...(seatPolicyIds ? { seatPolicyIds } : {}),
     diceModelId: diceModel.id,
     diceModelStatus: diceModel.status,
     diceModelIsExact: diceModel.isExact
@@ -1065,7 +1103,8 @@ export function runRollout(
       };
     }
 
-    const chosenAction = policy.selectAction(state, actorId, legalActions, policyRng, {
+    const actorPolicy = options?.policiesByPlayerId?.[actorId] ?? policy;
+    const chosenAction = actorPolicy.selectAction(state, actorId, legalActions, policyRng, {
       stepIndex: actionsSimulated,
       bankTradesThisTurn
     });
@@ -1080,7 +1119,7 @@ export function runRollout(
         turnsSimulated,
         totalCompletedTurns: state.completedTurns,
         sampledDiceRolls,
-        reason: `Policy '${policy.id}' selected an illegal or unsupported action '${String(chosenAction?.type)}' for '${actorId}' in phase '${state.phase}'.`,
+        reason: `Policy '${actorPolicy.id}' selected an illegal or unsupported action '${String(chosenAction?.type)}' for '${actorId}' in phase '${state.phase}'.`,
         ...(recordTrace ? { trace } : {})
       };
     }

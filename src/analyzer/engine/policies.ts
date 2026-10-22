@@ -19,11 +19,17 @@ import {
   type ConcreteSimulatedGameState,
   type ConcreteSimulatedPlayerState
 } from "./state";
-import { findImmediateWinningAction, type RolloutPolicy, type RolloutPolicyContext } from "./rollout";
+import {
+  baselineRolloutPolicy,
+  findImmediateWinningAction,
+  type RolloutPolicy,
+  type RolloutPolicyContext
+} from "./rollout";
 import type { SeededRng } from "./rng";
 
 const COST_CITY: ResourceBag = { grain: 2, ore: 3 };
 const COST_SETTLEMENT: ResourceBag = { lumber: 1, brick: 1, wool: 1, grain: 1 };
+const COST_ROAD: ResourceBag = { lumber: 1, brick: 1 };
 const COST_DEV: ResourceBag = { wool: 1, grain: 1, ore: 1 };
 
 function sumHand(h: ConcreteSimulatedPlayerState["hand"]): number {
@@ -386,10 +392,228 @@ export const aggressiveDevRolloutPolicy: RolloutPolicy = {
   }
 };
 
+function resourcePips(state: ConcreteSimulatedGameState, cornerIndex: number, resource: "lumber" | "brick"): number {
+  const corner = state.topology.corners[cornerIndex];
+  if (!corner) return 0;
+  let total = 0;
+  for (const hexIndex of corner.hexIndices) {
+    const hex = state.topology.hexes[hexIndex];
+    if (hex?.resource === resource) total += hex.pips;
+  }
+  return total;
+}
+
+function expansionPips(state: ConcreteSimulatedGameState, cornerIndex: number): number {
+  return resourcePips(state, cornerIndex, "lumber") * 3 + resourcePips(state, cornerIndex, "brick") * 3 + (state.topology.corners[cornerIndex]?.pips ?? 0);
+}
+
+function cornerOpenForSettlement(state: ConcreteSimulatedGameState, cornerIndex: number): boolean {
+  if (state.cornerPiece[cornerIndex] !== 0) return false;
+  const corner = state.topology.corners[cornerIndex];
+  if (!corner || corner.pips <= 0) return false;
+  return !corner.adjacentCornerIndices.some((next) => state.cornerPiece[next] > 0);
+}
+
+/** True when this road reaches a distance-legal producing corner within two further roads. */
+function roadOpensSettlement(state: ConcreteSimulatedGameState, actorId: string, edgeIndex: number): boolean {
+  const edge = state.topology.edges[edgeIndex];
+  if (!edge) return false;
+  const queue: Array<{ cornerIndex: number; dist: number }> = [
+    { cornerIndex: edge.c1, dist: 0 },
+    { cornerIndex: edge.c2, dist: 0 }
+  ];
+  const seen = new Map<number, number>([
+    [edge.c1, 0],
+    [edge.c2, 0]
+  ]);
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (cornerOpenForSettlement(state, current.cornerIndex)) return true;
+    if (current.dist >= 2) continue;
+    const occupier = state.cornerOwner[current.cornerIndex];
+    if (occupier && occupier !== actorId) continue;
+    const corner = state.topology.corners[current.cornerIndex];
+    for (let i = 0; i < corner.incidentEdgeIndices.length; i++) {
+      const nextEdge = corner.incidentEdgeIndices[i];
+      const nextCorner = corner.adjacentCornerIndices[i];
+      const owner = nextEdge === edgeIndex ? actorId : state.edgeOwner[nextEdge];
+      if (owner && owner !== actorId) continue;
+      const nextDist = current.dist + (owner === actorId ? 0 : 1);
+      if (nextDist > 2) continue;
+      const previous = seen.get(nextCorner);
+      if (previous !== undefined && previous <= nextDist) continue;
+      seen.set(nextCorner, nextDist);
+      queue.push({ cornerIndex: nextCorner, dist: nextDist });
+    }
+  }
+  return false;
+}
+
+function roadTouchesOpponent(state: ConcreteSimulatedGameState, actorId: string, edgeIndex: number): boolean {
+  const edge = state.topology.edges[edgeIndex];
+  if (!edge) return false;
+  for (const cornerIndex of [edge.c1, edge.c2]) {
+    const corner = state.topology.corners[cornerIndex];
+    if (!corner) continue;
+    if (corner.adjacentCornerIndices.some((next) => {
+      const owner = state.cornerOwner[next];
+      return owner !== null && owner !== actorId && state.cornerPiece[next] > 0;
+    })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Expansion policy. Settlements and wood/brick roads come before cities and development cards.
+ * A road that also sits on an opponent approach gets a bonus. It does not read hidden cards.
+ */
+export const settlementRacerRolloutPolicy: RolloutPolicy = {
+  id: "settlement_racer_v1",
+
+  selectAction(state, actorId, legalActions, rng, context) {
+    if (legalActions.length === 0) return { type: "endTurn" };
+    if (legalActions.length === 1) return legalActions[0];
+    const immediateWin = findImmediateWinningAction(state, actorId, legalActions);
+    if (immediateWin) return immediateWin;
+    if (state.phase !== "setup_settlement" && state.phase !== "setup_road" && state.phase !== "main") {
+      return baselineRolloutPolicy.selectAction(state, actorId, legalActions, rng, context);
+    }
+    const actor = state.players.find((player) => player.id === actorId) ?? state.players[state.turnPlayerIndex];
+
+    if (state.phase === "setup_settlement") {
+      const scored = legalActions
+        .filter((action): action is Extract<SimulatedAction, { type: "placeSetupSettlement" }> => action.type === "placeSetupSettlement")
+        .map((action) => ({ action, score: expansionPips(state, action.cornerIndex) }))
+        .sort((a, b) => b.score - a.score);
+      return scored[0]?.action ?? rng.pick(legalActions);
+    }
+
+    if (state.phase === "setup_road") {
+      const roads = legalActions.filter((action): action is Extract<SimulatedAction, { type: "placeSetupRoad" }> => action.type === "placeSetupRoad");
+      let best = roads[0];
+      let bestScore = -Infinity;
+      for (const action of roads) {
+        const edge = state.topology.edges[action.edgeIndex];
+        let score = roadTouchesOpponent(state, actorId, action.edgeIndex) ? 4 : 0;
+        for (const cornerIndex of edge ? [edge.c1, edge.c2] : []) {
+          if (state.cornerPiece[cornerIndex] !== 0) continue;
+          score += expansionPips(state, cornerIndex);
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          best = action;
+        }
+      }
+      return best ?? rng.pick(legalActions);
+    }
+
+    const settle = legalActions
+      .filter((action): action is Extract<SimulatedAction, { type: "buildSettlement" }> => action.type === "buildSettlement")
+      .map((action) => ({ action, score: expansionPips(state, action.cornerIndex) }))
+      .sort((a, b) => b.score - a.score);
+    if (settle[0]) return settle[0].action;
+
+    const roads = legalActions.filter((action): action is Extract<SimulatedAction, { type: "buildRoad" }> => action.type === "buildRoad");
+    if (roads.length > 0 && actor.settlementsLeft > 0 && getLegalSettlementCorners(state, actorId).length === 0) {
+      let best: Extract<SimulatedAction, { type: "buildRoad" }> | undefined;
+      let bestScore = -Infinity;
+      for (const action of roads) {
+        const opens = roadOpensSettlement(state, actorId, action.edgeIndex);
+        const blocks = roadTouchesOpponent(state, actorId, action.edgeIndex);
+        if (!opens && !blocks) continue;
+        const edge = state.topology.edges[action.edgeIndex];
+        let score = blocks ? 6 : 0;
+        for (const cornerIndex of edge ? [edge.c1, edge.c2] : []) {
+          if (state.cornerPiece[cornerIndex] !== 0) continue;
+          score += expansionPips(state, cornerIndex);
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          best = action;
+        }
+      }
+      if (best) return best;
+    }
+
+    const trades = legalActions.filter((action): action is BankTradeAction => action.type === "bankTrade");
+    if (actor.settlementsLeft === 0) {
+      const cityWhenEmpty = legalActions
+        .filter((action): action is Extract<SimulatedAction, { type: "buildCity" }> => action.type === "buildCity")
+        .sort((a, b) => (state.topology.corners[b.cornerIndex]?.pips ?? 0) - (state.topology.corners[a.cornerIndex]?.pips ?? 0));
+      if (cityWhenEmpty[0]) return cityWhenEmpty[0];
+      if (trades.length > 0 && context.bankTradesThisTurn < 4) {
+        const towardCity = selectBankTradeForTarget(actor, COST_CITY, trades, true);
+        if (towardCity) return towardCity;
+      }
+      return legalActions.find((action) => action.type === "endTurn") ?? rng.pick(legalActions);
+    }
+
+    if (trades.length > 0 && context.bankTradesThisTurn < 4) {
+      const towardSettlement = selectBankTradeForTarget(actor, COST_SETTLEMENT, trades, false);
+      if (towardSettlement) return towardSettlement;
+      const towardRoad = selectBankTradeForTarget(actor, COST_ROAD, trades, false);
+      if (towardRoad) return towardRoad;
+    }
+
+    const city = legalActions
+      .filter((action): action is Extract<SimulatedAction, { type: "buildCity" }> => action.type === "buildCity")
+      .sort((a, b) => (state.topology.corners[b.cornerIndex]?.pips ?? 0) - (state.topology.corners[a.cornerIndex]?.pips ?? 0));
+    if (city[0]) return city[0];
+    return legalActions.find((action) => action.type === "endTurn") ?? rng.pick(legalActions);
+  }
+};
+
+/**
+ * Award policy. It extends its own road whenever that increases length, ahead of cities
+ * and development cards. Hidden opponent cards are not read.
+ */
+export const longestRoadRolloutPolicy: RolloutPolicy = {
+  id: "longest_road_heuristic_v1",
+
+  selectAction(state, actorId, legalActions, rng, context) {
+    if (legalActions.length === 0) return { type: "endTurn" };
+    if (legalActions.length === 1) return legalActions[0];
+    const immediateWin = findImmediateWinningAction(state, actorId, legalActions);
+    if (immediateWin) return immediateWin;
+    if (state.phase !== "setup_road" && state.phase !== "main" && state.phase !== "road_building_1" && state.phase !== "road_building_2") {
+      return baselineRolloutPolicy.selectAction(state, actorId, legalActions, rng, context);
+    }
+    const actor = state.players.find((player) => player.id === actorId) ?? state.players[state.turnPlayerIndex];
+
+    const lengthening = legalActions.filter(
+      (action): action is Extract<SimulatedAction, { type: "buildRoad" | "placeSetupRoad" | "placeFreeRoad" }> =>
+        action.type === "buildRoad" || action.type === "placeSetupRoad" || action.type === "placeFreeRoad"
+    );
+    let bestRoad = lengthening[0];
+    let bestGain = 0;
+    for (const action of lengthening) {
+      const nextEdges = [...state.edgeOwner];
+      nextEdges[action.edgeIndex] = actorId;
+      const gain = computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdges, actorId) - actor.roadLength;
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestRoad = action;
+      }
+    }
+    if (bestRoad && bestGain > 0) return bestRoad;
+
+    const settle = legalActions.find((action) => action.type === "buildSettlement" || action.type === "placeSetupSettlement");
+    if (settle) return settle;
+    const city = legalActions.find((action) => action.type === "buildCity");
+    if (city) return city;
+    return legalActions.find((action) => action.type === "endTurn") ?? rng.pick(legalActions);
+  }
+};
+
 /**
  * All Stage 3.5 diagnostic policies added by this module, in a stable order so generated
  * reports are reproducible. The production `baselineRolloutPolicy` is imported separately by
  * the harness so it is always evaluated alongside these.
+ *
+ * The settlement racer and longest-road policies are cross-play opponents. They are not added
+ * here, so the tactical suite does not treat them as the diagnostic pair.
  */
 export const STAGE_3_5_DIAGNOSTIC_POLICIES: readonly RolloutPolicy[] = [
   aggressiveDevRolloutPolicy,

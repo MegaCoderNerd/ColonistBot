@@ -58,6 +58,34 @@ export {
 
 export { buildAllSyntheticFixtures, createBaseState } from "./fixtures";
 
+export { buildGeneratedOpening, type GeneratedOpening } from "./generated-board";
+
+export { runCrossPlay, playBothSeats, crossPlayRoster, type CrossPlayReport, type CrossPlayOptions } from "./crossplay";
+
+export {
+  PROGRESS_DIAG_PROTOCOL,
+  diagnosisSeedList,
+  holdoutSeedList,
+  diagnoseGame,
+  runProgressDiagnosis,
+  formatProgressReport,
+  settlementRoadDistance,
+  compareCityTradeCorrection,
+  formatCityTradeComparison
+} from "./progress-diag";
+
+export {
+  RACE_TUNE_PROTOCOL,
+  RACE_TUNE_CANDIDATES,
+  confirmationSeedList,
+  developmentSeedList,
+  seedSetsAreDisjoint,
+  selectRaceCandidate,
+  bootstrapMeanDifference,
+  runRaceWeightExperiment,
+  formatRaceTuneReport
+} from "./race-tune";
+
 export { buildTacticalCases, type TacticalPositions } from "./tactical";
 
 export {
