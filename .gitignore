@@ -1,2 +1,11 @@
 node_modules/
 dist/
+.venv/
+ml/.venv/
+ml/runs/
+ml/checkpoints/
+data/external/
+data/ml/generated/
+*.pt
+__pycache__/
+.pytest_cache/

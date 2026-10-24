@@ -12,6 +12,8 @@
  *   npm run benchmark:policy -- --race-tune        # frozen development then confirmation
  *   npm run benchmark:policy -- --progress-diag    # cutoff traces on eight development seeds
  *   npm run benchmark:policy -- --city-trade-check # rejected partial-trade trial, both seed sets
+ *   npm run benchmark:policy -- --devcard-rule development
+ *   npm run benchmark:policy -- --devcard-rule holdout
  */
 
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -27,6 +29,13 @@ import {
   holdoutSeedList,
   runProgressDiagnosis
 } from "./progress-diag";
+import {
+  compareDevCardRule,
+  decideDevCardRule,
+  devCardHoldoutSeedList,
+  developmentSeedList,
+  formatDevCardComparison
+} from "./devcard-rule";
 
 interface CliArgs {
   readonly jsonPath?: string;
@@ -36,6 +45,7 @@ interface CliArgs {
   readonly raceTune: boolean;
   readonly progressDiag: boolean;
   readonly cityTradeCheck: boolean;
+  readonly devcardRule?: "development" | "holdout" | "both";
 }
 
 function parseArgs(argv: readonly string[]): CliArgs {
@@ -46,6 +56,7 @@ function parseArgs(argv: readonly string[]): CliArgs {
   let raceTune = false;
   let progressDiag = false;
   let cityTradeCheck = false;
+  let devcardRule: "development" | "holdout" | "both" | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -64,14 +75,33 @@ function parseArgs(argv: readonly string[]): CliArgs {
       progressDiag = true;
     } else if (arg === "--city-trade-check") {
       cityTradeCheck = true;
+    } else if (arg === "--devcard-rule" && i + 1 < argv.length) {
+      const stage = argv[++i];
+      if (stage === "development" || stage === "holdout" || stage === "both") devcardRule = stage;
     }
   }
-  return { ...(jsonPath !== undefined ? { jsonPath } : {}), ...(trials !== undefined ? { trials } : {}), ...(seed !== undefined ? { seed } : {}), noSweep, raceTune, progressDiag, cityTradeCheck };
+  return { ...(jsonPath !== undefined ? { jsonPath } : {}), ...(trials !== undefined ? { trials } : {}), ...(seed !== undefined ? { seed } : {}), noSweep, raceTune, progressDiag, cityTradeCheck, ...(devcardRule !== undefined ? { devcardRule } : {}) };
 }
 
 function main(): void {
   const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.devcardRule) {
+    const runDevelopment = args.devcardRule === "development" || args.devcardRule === "both";
+    const runHoldout = args.devcardRule === "holdout" || args.devcardRule === "both";
+    if (runDevelopment) {
+      const development = compareDevCardRule(developmentSeedList(), "Development seeds, production-aware dev card vs baseline. Not used for adoption.");
+      process.stdout.write(formatDevCardComparison(development) + "\n\n");
+    }
+    if (runHoldout) {
+      const holdout = compareDevCardRule(devCardHoldoutSeedList(), "Holdout seeds, production-aware dev card vs baseline.");
+      const decision = decideDevCardRule(holdout);
+      process.stdout.write(formatDevCardComparison(holdout) + "\n");
+      process.stdout.write(`Decision: ${decision.decision}. ${decision.reason}\n`);
+    }
+    return;
+  }
 
   if (args.cityTradeCheck) {
     process.stdout.write(formatCityTradeComparison(compareCityTradeCorrection(diagnosisSeedList(), "Diagnosis seeds, partial city trade vs current gate")) + "\n\n");

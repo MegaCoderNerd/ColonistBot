@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "benchmark:policy": "node scripts/benchmark-policy.mjs",
+    "ml:engine": "node scripts/ml-engine.mjs",
     "build:ext": "node scripts/build-ext.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

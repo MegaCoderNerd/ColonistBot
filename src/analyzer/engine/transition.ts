@@ -473,6 +473,11 @@ function classifyRoadConnectivity(
   return blockedTouch ? "blocked_by_opponent_building" : "unconnected_road";
 }
 
+/** True when the edge touches the player's building or road without crossing an opponent building. */
+export function roadConnectsToOwnNetwork(state: ConcreteSimulatedGameState, playerId: string, edgeIndex: number): boolean {
+  return classifyRoadConnectivity(state, playerId, edgeIndex) === "ok";
+}
+
 export function getLegalSetupSettlementCorners(state: ConcreteSimulatedGameState, playerId: string): number[] {
   if (state.phase !== "setup_settlement") return [];
   const active = state.players[state.turnPlayerIndex];

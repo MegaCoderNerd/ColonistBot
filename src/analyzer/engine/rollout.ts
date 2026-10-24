@@ -244,6 +244,58 @@ function scoreCornerForPlayer(state: ConcreteSimulatedGameState, cornerIndex: nu
   return score;
 }
 
+export function isDistanceOpenCorner(state: ConcreteSimulatedGameState, cornerIndex: number): boolean {
+  return isCornerDistanceOpen(state, cornerIndex);
+}
+
+/**
+ * Additional roads from the player's current roads and buildings to a
+ * distance-open corner. Owned edges cost 0. Empty edges cost 1. Opponent
+ * edges and opponent buildings block. Depth is capped at 3; 99 means none
+ * within the cap. 0 means a distance-open corner already touches this network.
+ * This does not check settlements remaining or resource cost.
+ */
+export function settlementReachFromNetwork(state: ConcreteSimulatedGameState, playerId: string, maxDepth = 3): number {
+  const dist = new Map<number, number>();
+  const deque: number[] = [];
+  const relax = (corner: number, next: number, front: boolean) => {
+    if (next > maxDepth) return;
+    const previous = dist.get(corner);
+    if (previous !== undefined && previous <= next) return;
+    dist.set(corner, next);
+    if (front) deque.unshift(corner);
+    else deque.push(corner);
+  };
+  for (let corner = 0; corner < state.cornerOwner.length; corner++) {
+    if (state.cornerOwner[corner] === playerId) relax(corner, 0, true);
+  }
+  for (let edgeIndex = 0; edgeIndex < state.edgeOwner.length; edgeIndex++) {
+    if (state.edgeOwner[edgeIndex] !== playerId) continue;
+    const edge = state.topology.edges[edgeIndex];
+    relax(edge.c1, 0, true);
+    relax(edge.c2, 0, true);
+  }
+  let best = 99;
+  while (deque.length > 0) {
+    const corner = deque.shift()!;
+    const current = dist.get(corner)!;
+    if (isCornerDistanceOpen(state, corner)) best = Math.min(best, current);
+    if (current >= maxDepth) continue;
+    const owner = state.cornerOwner[corner];
+    if (owner !== null && owner !== playerId) continue;
+    const node = state.topology.corners[corner];
+    for (let index = 0; index < node.incidentEdgeIndices.length; index++) {
+      const edgeIndex = node.incidentEdgeIndices[index];
+      const next = node.adjacentCornerIndices[index];
+      const edgeOwner = state.edgeOwner[edgeIndex];
+      if (edgeOwner !== null && edgeOwner !== playerId) continue;
+      const step = edgeOwner === playerId ? 0 : 1;
+      relax(next, current + step, step === 0);
+    }
+  }
+  return best;
+}
+
 function isCornerDistanceOpen(state: ConcreteSimulatedGameState, cornerIndex: number): boolean {
   if (state.cornerPiece[cornerIndex] !== 0) return false;
   for (const adj of state.topology.corners[cornerIndex].adjacentCornerIndices) {
@@ -256,7 +308,7 @@ function isCornerDistanceOpen(state: ConcreteSimulatedGameState, cornerIndex: nu
  * Computes the minimum number of additional roads `playerId` needs after placing on `edgeIndex`
  * to reach an open distance-legal settlement corner (0 if `edgeIndex` directly touches an open legal corner).
  */
-function minAdditionalRoadsToOpenSettlementFromEdge(
+export function minAdditionalRoadsToOpenSettlementFromEdge(
   state: ConcreteSimulatedGameState,
   playerId: string,
   edgeIndex: number,
@@ -475,6 +527,25 @@ function selectBankTradeForTarget(
 }
 
 /**
+ * Offline dev-card gate. It is not part of `baseline_heuristic_v1`.
+ *
+ * When the acting player's own public ore production is positive, a development
+ * card is kept only if paying `COST_DEV` still leaves `COST_CITY` ore and grain.
+ * Zero ore production keeps the baseline purchase. Opponent hands are not read.
+ * The pip total is the same public production model the race evaluator uses.
+ */
+export function devCardLeavesCityReserve(hand: ResourceHand): boolean {
+  const oreAfter = hand.ore - (COST_DEV.ore ?? 0);
+  const grainAfter = hand.grain - (COST_DEV.grain ?? 0);
+  return oreAfter >= (COST_CITY.ore ?? 0) && grainAfter >= (COST_CITY.grain ?? 0);
+}
+
+/** Ore and grain actually charged for a development card. */
+export function devCardResourceCost(): { ore: number; grain: number } {
+  return { ore: COST_DEV.ore ?? 0, grain: COST_DEV.grain ?? 0 };
+}
+
+/**
  * Simple, documented, deterministic-under-seed baseline rollout policy.
  *
  * Design principles:
@@ -482,12 +553,15 @@ function selectBankTradeForTarget(
  * - Takes any immediate legal winning action first.
  * - Uses only public board information and `actorId`'s own hand/devs (never peeks at opponent hands or `devDeckOrder`).
  * - Prevents aimless road spam and bank-trade loops so rollouts make forward VP progress and terminate reliably.
+ *
+ * `productionAwareDevCards` is an offline opt-in. The default leaves this policy unchanged.
  */
 export function createHeuristicRolloutPolicy(
   id: string,
   raceAware: boolean,
   weights?: RaceWeights,
-  partialCityTrades = false
+  partialCityTrades = false,
+  productionAwareDevCards = false
 ): RolloutPolicy {
   return {
   id,
@@ -742,11 +816,16 @@ export function createHeuristicRolloutPolicy(
           }
         }
 
-        // 7. Buy Development Card (`buyDevCard`) if legal and not holding 2 grain + 2 ore right before a city
+        // 7. Buy Development Card (`buyDevCard`) if legal and not holding 2 grain + 2 ore right before a city.
+        // The production-aware flag can decline that buy when this seat produces ore and the
+        // city reserve would be spent. It does not add buys the baseline would refuse.
         const buyDevAction = legalActions.find((a) => a.type === "buyDevCard");
         if (buyDevAction) {
           const almostCity = canCity && actor.hand.grain >= 2 && actor.hand.ore >= 2;
-          if (!almostCity || sumHand(actor.hand) > state.rules.cardDiscardLimit) {
+          const baselineBuys = !almostCity || sumHand(actor.hand) > state.rules.cardDiscardLimit;
+          const oreProduction = productionOf(state, actorId).ore;
+          const reserveOk = !productionAwareDevCards || oreProduction <= 0 || devCardLeavesCityReserve(actor.hand);
+          if (baselineBuys && reserveOk) {
             return buyDevAction;
           }
         }
@@ -770,6 +849,19 @@ export const baselineRolloutPolicy = createHeuristicRolloutPolicy("baseline_heur
  * Benchmark-only. It is not the live coach.
  */
 export const baselineDistanceOnlyRolloutPolicy = createHeuristicRolloutPolicy("baseline_distance_only_v1", false);
+
+/**
+ * Offline experiment. Same heuristic as `baseline_heuristic_v1` except the
+ * production-aware development-card gate. The live coach and the default
+ * rollout policy do not select this id.
+ */
+export const productionAwareDevCardRolloutPolicy = createHeuristicRolloutPolicy(
+  "production_aware_dev_card_v1",
+  true,
+  undefined,
+  false,
+  true
+);
 
 function pickBestYearOfPlentyAction(
   state: ConcreteSimulatedGameState,

@@ -75,6 +75,16 @@ export {
 } from "./progress-diag";
 
 export {
+  DEVCARD_RULE_PROTOCOL,
+  developmentSeedList as devCardDevelopmentSeedList,
+  devCardHoldoutSeedList,
+  devCardSeedSetsAreDisjoint,
+  compareDevCardRule,
+  decideDevCardRule,
+  formatDevCardComparison
+} from "./devcard-rule";
+
+export {
   RACE_TUNE_PROTOCOL,
   RACE_TUNE_CANDIDATES,
   confirmationSeedList,

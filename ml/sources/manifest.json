@@ -1,0 +1,39 @@
+{
+  "external_colonist_games_downloaded": 0,
+  "external_games_approved_for_training": 0,
+  "training_sources": [
+    "synthetic_fixture",
+    "heuristic_demonstration",
+    "synthetic_self_play",
+    "reinforcement_target"
+  ],
+  "not_used": [
+    {
+      "name": "OrgadYron/catan_43k_games_dataset and theocaplan-del/Catan-dataset",
+      "claimed_games": 43947,
+      "status": "blocked",
+      "reason": "The cited release is not an available approved download. Colonist terms require written permission before service data is used to train an AI model. No game files were downloaded."
+    },
+    {
+      "name": "sousa16/catan-analyzer aggregates",
+      "status": "blocked",
+      "reason": "Derived from the same Colonist corpus. Not downloaded."
+    },
+    {
+      "name": "Kaggle PlayCatan 50-game aggregate",
+      "status": "not_suitable",
+      "reason": "Post-game aggregates, not action sequences. Non-commercial license. Not downloaded."
+    },
+    {
+      "name": "bcollazo/catanatron",
+      "status": "not_vendored",
+      "reason": "GPL-3.0 code was not copied. Heuristic output would still be heuristic-generated, not human play. Not downloaded."
+    },
+    {
+      "name": "Edinburgh CIG 2015 tournament games",
+      "status": "not_located",
+      "reason": "No downloadable game file was found. Not downloaded."
+    }
+  ],
+  "future_work": "A written-permission request for Colonist data is a separate workstream and does not block synthetic self-play."
+}

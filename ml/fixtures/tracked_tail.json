@@ -1,0 +1,28 @@
+{
+  "bank_exact": true,
+  "opponents": [
+    {
+      "tracked_resources": {
+        "lumber": 2,
+        "brick": 0,
+        "wool": 1,
+        "grain": 0,
+        "ore": 3,
+        "unknown": 0,
+        "exact": true
+      }
+    },
+    {
+      "tracked_resources": {
+        "lumber": 0,
+        "brick": 1,
+        "wool": 0,
+        "grain": 0,
+        "ore": 0,
+        "unknown": 2,
+        "exact": false
+      }
+    }
+  ],
+  "expected_tail": [0.2, 0, 0.1, 0, 0.3, 0, 1, 0, 0.1, 0, 0, 0, 0.2, 0, 1]
+}
