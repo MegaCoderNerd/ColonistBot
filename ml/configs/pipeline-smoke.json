@@ -1,0 +1,17 @@
+{
+  "kind": "supervised",
+  "data": "data/ml/generated/overnight_smoke.jsonl",
+  "out": "ml/runs/pipeline-smoke",
+  "epochs": 2,
+  "batch_size": 16,
+  "seed": 7,
+  "learning_rate": 0.001,
+  "device": "cpu",
+  "eval": {
+    "every_epochs": 1,
+    "seeds": ["ml-holdout-0", "ml-holdout-1"],
+    "vp": 3,
+    "max_turns": 12,
+    "max_actions": 40
+  }
+}

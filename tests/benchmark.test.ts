@@ -1,5 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { loadRecordingCorpus } from "../src/analyzer/recordings/load";
 import { describe, it, expect } from "vitest";
 
 import { buildBoardTopology } from "../src/analyzer/engine/topology";
@@ -37,33 +36,8 @@ type RecordingFixture =
   };
 
 function getRecordings(): RecordingFixture[] {
-  const rootDir = process.cwd();
-
-  const candidates = [
-    process.env.COLONIST_RECORDINGS_PATH,
-    join(rootDir, "fixtures", "colonist-recordings.json"),
-    join(rootDir, "tests", "fixtures", "colonist-recordings.json"),
-    join(rootDir, "colonist-recordings.json"),
-  ].filter((path): path is string => Boolean(path));
-
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-
-    try {
-      const raw = JSON.parse(readFileSync(path, "utf8")) as {
-        recordings?: RecordingFixture[];
-      };
-
-      if (Array.isArray(raw.recordings)) {
-        return raw.recordings;
-      }
-    } catch {
-      // Try the next candidate. Missing optional data must not
-      // prevent deterministic synthetic benchmarks from running.
-    }
-  }
-
-  return [];
+  const corpus = loadRecordingCorpus(process.cwd());
+  return [...corpus.recordings] as RecordingFixture[];
 }
 
 function createFallbackBoard(): Parameters<typeof buildBoardTopology>[0] {

@@ -8,6 +8,8 @@
     "ml:engine": "node scripts/ml-engine.mjs",
     "build:ext": "node scripts/build-ext.mjs",
     "test": "vitest run",
+    "test:recordings": "node scripts/test-recordings.mjs",
+    "validate:recordings": "node scripts/validate-recordings.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

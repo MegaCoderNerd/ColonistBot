@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { transformSync } from "esbuild";
 import { describe, expect, it } from "vitest";
@@ -14,20 +14,14 @@ import { planMidgame } from "../src/analyzer/strategy";
 import { planTurn } from "../src/analyzer/engine/decide";
 import { networkLength } from "../src/analyzer/engine/roads";
 import { createHelper } from "../src/extension/helper";
-import type { Recording } from "../src/shared/schema";
+import { loadRecordingCorpus, requireRecording } from "../src/analyzer/recordings/load";
 
-const RECORDINGS_PATH =
-  process.env.COLONIST_RECORDINGS_PATH ??
-  [resolve(__dirname, "../fixtures/colonist-recordings.json"), resolve(__dirname, "../colonist-recordings.json")].find(
-    (path) => existsSync(path)
-  );
-const recordingsAvailable = RECORDINGS_PATH !== undefined && existsSync(RECORDINGS_PATH);
+const recordings = loadRecordingCorpus(resolve(__dirname, "..")).recordings;
+const recordingsAvailable = recordings.length > 0;
 const ROOT = resolve(__dirname, "..");
 
-function loadRecordings(): Recording[] {
-  if (!RECORDINGS_PATH || !existsSync(RECORDINGS_PATH)) return [];
-  const raw = JSON.parse(readFileSync(RECORDINGS_PATH, "utf8")) as { recordings: Recording[] };
-  return raw.recordings;
+function loadRecordings() {
+  return recordings;
 }
 
 function normalizeBundle(code: string): string {
@@ -180,7 +174,7 @@ describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () =>
 
   it.skipIf(!recordingsAvailable)("runs the live helper.feed + helper.view regression on farm9373 (recording fixture required)", () => {
     const recordings = loadRecordings();
-    const farm = recordings.find((r) => r.id === "farm9373")!;
+    const farm = requireRecording(recordings, "farm9373");
     const helper = createHelper();
     for (const f of farm.frames) helper.feed(f);
     const view = helper.view(
@@ -205,9 +199,7 @@ describe("Stage 1 & Steps 2.1–2.5 — Baseline Bundle & Runtime Parity", () =>
     const targetIds = ["edge9896", "farm9373", "deck7708"];
 
     for (const id of targetIds) {
-      const rec = recordings.find((r) => r.id === id);
-      expect(rec).toBeDefined();
-      if (!rec) continue;
+      const rec = requireRecording(recordings, id);
 
       const { decoded, stats } = decodeFrames(rec.frames);
       expect(stats.totalFrames).toBe(rec.frames.length);

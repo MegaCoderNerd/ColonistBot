@@ -1,0 +1,10 @@
+{
+  "kind": "supervised",
+  "data": "ml/fixtures/synthetic_decisions.jsonl",
+  "out": "ml/runs/local-smoke",
+  "epochs": 2,
+  "batch_size": 4,
+  "seed": 7,
+  "learning_rate": 0.001,
+  "device": "cpu"
+}

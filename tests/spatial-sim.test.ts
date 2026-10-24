@@ -1,4 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
@@ -80,19 +79,13 @@ import { planTurn } from "../src/analyzer/engine/decide";
 import { coachedOpening } from "../src/analyzer/engine/opening";
 import { robberTargets } from "../src/analyzer/advisor";
 import { createHelper } from "../src/extension/helper";
-import type { Recording } from "../src/shared/schema";
+import { loadRecordingCorpus, requireRecording } from "../src/analyzer/recordings/load";
 
-const RECORDINGS_PATH =
-  process.env.COLONIST_RECORDINGS_PATH ??
-  [resolve(__dirname, "../fixtures/colonist-recordings.json"), resolve(__dirname, "../colonist-recordings.json")].find(
-    (path) => existsSync(path)
-  );
-const recordingsAvailable = RECORDINGS_PATH !== undefined && existsSync(RECORDINGS_PATH);
+const recordings = loadRecordingCorpus(resolve(__dirname, "..")).recordings;
+const recordingsAvailable = recordings.length > 0;
 
-function loadRecordings(): Recording[] {
-  if (!RECORDINGS_PATH || !existsSync(RECORDINGS_PATH)) return [];
-  const raw = JSON.parse(readFileSync(RECORDINGS_PATH, "utf8")) as { recordings: Recording[] };
-  return raw.recordings;
+function loadRecordings() {
+  return recordings;
 }
 
 describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction", () => {
@@ -100,7 +93,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
 
   describe("1. BoardTopology Construction, Reciprocal Adjacency & Colonist ID Mapping", () => {
     it.skipIf(!recordingsAvailable)("constructs complete 19-hex, 54-corner, 72-edge, 9-port topology with reciprocal adjacency and cached lookup (recording fixture required)", () => {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const board = parsed.board!;
 
@@ -164,7 +157,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
 
     it.skipIf(!recordingsAvailable)("preserves original Colonist corner, edge, and hex IDs distinctly from internal array indices (recording fixture required)", () => {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const topo = getBoardTopology(parsed.board!);
 
@@ -208,7 +201,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
   describe("2. Canonical Observed State Reconstruction & Confidence Boundaries", () => {
     it.skipIf(!recordingsAvailable)("reconstructs placements, road lengths, public/hidden VP, and uncertain opponent state on edge9896, farm9373, and deck7708 (recording fixture required)", () => {
       // 1. edge9896: self (c5) has 8 visible VP + 0 hidden VP; opponent (c1) has 14 visible VP + 0 confirmed hidden VP + 2 unknown devs (maxPossibleVp = 16)
-      const edgeRec = recordings.find((r) => r.id === "edge9896")!;
+      const edgeRec = requireRecording(recordings, "edge9896");
       const edgeParsed = stateDiffAdapter.parse(decodeFrames(edgeRec.frames).decoded);
       const edgePlacements = placementsFrom(edgeParsed.events);
       const edgeState = buildObservedGameState({
@@ -241,7 +234,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(edgeOpp.awards.computedRoadLength).toBe(networkLength(edgeParsed.board!, edgePlacements, "c1"));
 
       // 2. farm9373: opponent (c1) holds 2 face-down dev cards (ID 10); verify they remain unknown and are not fabricated into confirmed VP
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
       const farmParser = new LogParser(farmRec.meta.me);
@@ -328,7 +321,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(uncertainOppState.playerById["c1"].hand.confidence).toBe("bounded");
 
       // 3. deck7708: self (c5) holds 3 confirmed hidden VP dev cards (12 visible + 3 hidden = 15 totalConfirmedVp); opponent (c1) has 10 visible + 1 unknown dev
-      const deckRec = recordings.find((r) => r.id === "deck7708")!;
+      const deckRec = requireRecording(recordings, "deck7708");
       const deckParsed = stateDiffAdapter.parse(decodeFrames(deckRec.frames).decoded);
       const deckPlacements = placementsFrom(deckParsed.events);
       const deckState = buildObservedGameState({
@@ -355,7 +348,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
 
     it.skipIf(!recordingsAvailable)("preserves authoritative gameSettings, distinguishes defaults and unknown values, and refuses to map unrecognized phases to main (recording fixture required)", () => {
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
 
@@ -415,7 +408,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
 
     it.skipIf(!recordingsAvailable)("handles mid-game or incomplete observations without fabricating exact state and separates observed vs concrete simulation validation (recording fixture required)", () => {
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
 
@@ -511,7 +504,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
 
     it.skipIf(!recordingsAvailable)("supports 2–6 player seat order structurally and preserves boundaries for adaptive behavior telemetry, imperfect priors, and observed trades (recording fixture required)", () => {
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
 
       const multiState = buildObservedGameState({
@@ -581,19 +574,29 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       });
     });
 
-    it.skipIf(!recordingsAvailable)("reconstructs valid ObservedGameState across all 53 captured recordings and measures reconstruction & clone latency (recording fixture required)", () => {
+    it.skipIf(!recordingsAvailable)("reconstructs a valid ObservedGameState for every accepted recording and measures reconstruction and clone latency (recording fixture required)", () => {
       let buildTopoMs = 0;
       let cachedTopoMs = 0;
       let buildStateWithReadMs = 0;
       let buildStateSnapshotMs = 0;
       let cloneStateMs = 0;
       let validCount = 0;
+      let missingBoard = 0;
+      const seenIds = new Set<string>();
 
       for (const rec of recordings) {
-        if (!rec.frames?.length) continue;
+        expect(seenIds.has(rec.id), `duplicate recording id ${rec.id}`).toBe(false);
+        seenIds.add(rec.id);
+        if (!rec.frames?.length) {
+          missingBoard += 1;
+          continue;
+        }
         const { decoded } = decodeFrames(rec.frames);
         const parsed = stateDiffAdapter.parse(decoded);
-        if (!parsed.board) continue;
+        if (!parsed.board) {
+          missingBoard += 1;
+          continue;
+        }
         const placements = placementsFrom(parsed.events);
 
         const t0 = performance.now();
@@ -645,7 +648,10 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
         validCount++;
       }
 
-      expect(validCount).toBe(53);
+      expect(seenIds.size).toBe(recordings.length);
+      expect(missingBoard).toBe(0);
+      expect(validCount).toBe(recordings.length);
+      expect(validCount).toBeGreaterThan(0);
       const avgBuildTopoUs = (buildTopoMs * 1000) / validCount;
       const avgCachedTopoUs = (cachedTopoMs * 1000) / validCount;
       const avgBuildStateWithReadUs = (buildStateWithReadMs * 1000) / validCount;
@@ -660,7 +666,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
 
   describe.skipIf(!recordingsAvailable)("Stage 3.2 — Rule-Correct Shared-Board Legal-Action & State-Transition Engine (recording fixture required)", () => {
     function getStandardTopology() {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       return getBoardTopology(parsed.board!);
     }
@@ -1557,7 +1563,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
     });
 
     it.skipIf(!recordingsAvailable)("8. Enforces strict 3-way information boundary on materializeConcreteState and fails closed on unsupported variants/rulesets (recording fixture required)", () => {
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farmRec.frames).decoded);
       const farmPlacements = placementsFrom(farmParsed.events);
       const farmParser = new LogParser(farmRec.meta.me);
@@ -1729,7 +1735,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
   // ===========================================================================
   describe("Stage 3.3 — Dice Modeling, Hidden-Information Determinization, and Rollout Engine", () => {
     function buildMidgameObservedFixture(recId: string, frameLimit: number) {
-      const rec = recordings.find((r) => r.id === recId)!;
+      const rec = requireRecording(recordings, recId);
       const { decoded } = decodeFrames(rec.frames.slice(0, frameLimit));
       const parsed = stateDiffAdapter.parse(decoded);
       const placements = placementsFrom(parsed.events);
@@ -1903,44 +1909,63 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       expect(explicitOverride.model.isExact).toBe(false);
     });
 
-    it.skipIf(!recordingsAvailable)("3. Recording-level empirical dice partitioning and holdout calibration (51 1v1 games vs 2 4P Rush games) (recording fixture required)", () => {
-      // Partition all 53 recordings by gameSettings (modeSetting, maxPlayers, diceSetting)
+    it.skipIf(!recordingsAvailable)("3. Recording-level empirical dice partitioning and holdout calibration (recording fixture required)", () => {
+      // The published 51-game / 16-game fit stays the dice model's evidence.
+      // This corpus is a different file. Calibration here uses its own cohorts.
+      const published = COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.standard1v1Balanced;
+      expect(published.gameCount).toBe(51);
+      expect(published.totalRolls).toBe(3568);
+      expect(published.holdoutRolls).toBe(1144);
+      expect(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.rush4pBalanced.gameCount).toBe(2);
+      expect(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.rush4pBalanced.totalRolls).toBe(140);
+
       const oneVOneRollSeqs: number[][] = [];
       const rush4pRollSeqs: number[][] = [];
+      const seenIds = new Set<string>();
+      let otherRules = 0;
 
       for (const rec of recordings) {
+        expect(seenIds.has(rec.id), `duplicate recording id ${rec.id}`).toBe(false);
+        seenIds.add(rec.id);
         const parsed = stateDiffAdapter.parse(decodeFrames(rec.frames).decoded);
         const gs = parsed.snapshot?.gameSettings;
         const rolls = parsed.events
           .filter((e): e is Extract<(typeof parsed.events)[number], { type: "roll" }> => e.type === "roll")
           .map((e) => e.total);
-        if (gs?.diceSetting === 1 && gs?.modeSetting === 0 && gs?.maxPlayers === 2) {
-          oneVOneRollSeqs.push(rolls);
-        } else if (gs?.diceSetting === 1 && gs?.modeSetting === 12 && gs?.maxPlayers === 4) {
-          rush4pRollSeqs.push(rolls);
-        }
+        const standard1v1 =
+          gs?.diceSetting === 1 && gs?.modeSetting === 0 && gs?.maxPlayers === 2 && gs?.victoryPointsToWin === 15;
+        const rush4p = gs?.diceSetting === 1 && gs?.modeSetting === 12 && gs?.maxPlayers === 4;
+        if (standard1v1) oneVOneRollSeqs.push(rolls);
+        else if (rush4p) rush4pRollSeqs.push(rolls);
+        else otherRules += 1;
       }
 
-      // Verify dataset partitioning matches documented empirical summary
-      expect(oneVOneRollSeqs.length).toBe(51);
-      expect(rush4pRollSeqs.length).toBe(2);
+      expect(seenIds.size).toBe(recordings.length);
+      expect(oneVOneRollSeqs.length + rush4pRollSeqs.length + otherRules).toBe(recordings.length);
+      expect(oneVOneRollSeqs.length).toBeGreaterThan(0);
+      expect(rush4pRollSeqs.length).toBeGreaterThan(0);
+      expect(otherRules).toBeGreaterThan(0);
 
       const stats1v1 = computeRollSequenceStats(oneVOneRollSeqs);
       const statsRush = computeRollSequenceStats(rush4pRollSeqs);
-      expect(stats1v1.totalRolls).toBe(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.standard1v1Balanced.totalRolls);
-      expect(statsRush.totalRolls).toBe(COLONIST_1V1_EMPIRICAL_DICE_SUMMARY.partitions.rush4pBalanced.totalRolls);
+      expect(stats1v1.totalRolls).toBe(oneVOneRollSeqs.reduce((sum, rolls) => sum + rolls.length, 0));
+      expect(statsRush.totalRolls).toBe(rush4pRollSeqs.reduce((sum, rolls) => sum + rolls.length, 0));
+      expect(stats1v1.totalRolls).toBeGreaterThan(0);
+      expect(statsRush.totalRolls).toBeGreaterThan(0);
 
-      // 1. Disjoint 36-roll windows frequently violate the 36-combination cap (91/128 in 1v1), falsifying a single 36-card deck
+      // 1. Disjoint 36-roll windows frequently violate the 36-combination cap, falsifying a single 36-card deck
       expect(stats1v1.disjoint36WindowViolations.violatingWindows).toBeGreaterThan(80);
-      // 2. Disjoint 24-roll windows have ZERO violations across all 51 1v1 games (0/174) and across the 2 Rush games (0/6)
+      // 2. Disjoint 24-roll windows have zero violations on both the 15-VP two-player cohort and the rush games
       expect(stats1v1.disjoint24WindowViolations.violatingWindows).toBe(0);
       expect(statsRush.disjoint24WindowViolations.violatingWindows).toBe(0);
-      // 3. Consecutive sum repeat rate (lag 1) is significantly suppressed relative to fair 2d6 (7.42% vs 11.27%)
+      // 3. Consecutive sum repeat rate (lag 1) stays below the fair 2d6 rate
       expect(stats1v1.lag1RepeatRate).toBeLessThan(0.085);
 
-      // Recording-level holdout evaluation: 35 training games vs 16 held-out test games
-      const holdoutGames = oneVOneRollSeqs.slice(35);
-      expect(holdoutGames.length).toBe(16);
+      // Same recording-level holdout fraction as the published 16/51 split, taken from the end of this file.
+      const holdoutCount = Math.round(oneVOneRollSeqs.length * (16 / 51));
+      const holdoutGames = oneVOneRollSeqs.slice(oneVOneRollSeqs.length - holdoutCount);
+      expect(holdoutGames.length).toBe(holdoutCount);
+      expect(holdoutCount).toBeGreaterThan(0);
 
       const fairModel = createDiceModel("standard_fair_2d6");
       const marginalModel = createDiceModel("balanced_stationary_marginal_approx");
@@ -1949,7 +1974,8 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       const calibration = evaluateDiceModelsOnHoldoutGames([fairModel, marginalModel, shoeModel], holdoutGames, "aligned");
       const [calFair, calMarginal, calShoe] = calibration;
 
-      expect(calFair.rollsEvaluated).toBe(1144);
+      expect(calFair.rollsEvaluated).toBe(holdoutGames.reduce((sum, rolls) => sum + rolls.length, 0));
+      expect(calFair.rollsEvaluated).toBeGreaterThan(0);
       expect(calFair.isExact).toBe(true);
       expect(calMarginal.isExact).toBe(false);
       expect(calShoe.isExact).toBe(false);
@@ -1962,7 +1988,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
 
     it.skipIf(!recordingsAvailable)("4–8. Hidden-Information Determinization: exact self hands, bounded opponent hands, resource conservation, and dev-card sampling without replacement (recording fixture required)", () => {
       // Mid-game state from farm9373 (frame 1000: turnState=2, actionState=0 -> phase 'main')
-      const farmRec = recordings.find((r) => r.id === "farm9373")!;
+      const farmRec = requireRecording(recordings, "farm9373");
       const { decoded } = decodeFrames(farmRec.frames.slice(0, 1000));
       const parsed = stateDiffAdapter.parse(decoded);
       const placements = placementsFrom(parsed.events);
@@ -2475,7 +2501,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
   // ===========================================================================
   describe("Stage 3.4 — Coach Shadow-Mode Integration, Paired Candidate Evaluation, and Safety Boundaries", () => {
     function parseFixtureSlice(recId: string, frameLimit?: number) {
-      const rec = recordings.find((r) => r.id === recId)!;
+      const rec = requireRecording(recordings, recId);
       const frames = frameLimit ? rec.frames.slice(0, frameLimit) : rec.frames;
       const { decoded } = decodeFrames(frames);
       const parsed = stateDiffAdapter.parse(decoded);
@@ -3374,7 +3400,7 @@ describe("Stage 3.1 — Board Topology & Canonical Observed State Reconstruction
       const helperStale = createHelper(3, {
         shadowRollout: { enabled: true, baseSeed: "stage-3.4-helper-stale" }
       });
-      const rec = recordings.find((r) => r.id === "farm9373")!;
+      const rec = requireRecording(recordings, "farm9373");
       for (const f of rec.frames.slice(0, 850)) helperStale.feed(f);
       const t0 = Date.now() + 5000;
       helperStale.view(

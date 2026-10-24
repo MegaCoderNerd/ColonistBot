@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .evaluate import evaluate_against_baseline
+from .evaluate import evaluate_against_baseline, parse_eval_seeds
 from .model import PolicyValueNet
 from .rl import EVAL_SEEDS
 from .schema import load_jsonl
@@ -207,7 +207,16 @@ def cmd_eval(args: argparse.Namespace) -> None:
     model, _optimizer, _payload = load_checkpoint(args.checkpoint, device)
     bridge = SimulatorBridge(repo_root())
     try:
-        report = evaluate_against_baseline(bridge, model, device, args.checkpoint, args.vp, args.max_turns, args.max_actions)
+        report = evaluate_against_baseline(
+            bridge,
+            model,
+            device,
+            args.checkpoint,
+            args.vp,
+            args.max_turns,
+            args.max_actions,
+            parse_eval_seeds(args.seeds),
+        )
     finally:
         bridge.close()
     out = Path(args.out)
@@ -591,6 +600,125 @@ def cmd_phase6(args: argparse.Namespace) -> None:
     }, indent=2))
 
 
+def cmd_train_v7(args: argparse.Namespace) -> None:
+    from .aggregate import mix_corpora
+    from .checkpoint import save_checkpoint
+    from .match import _weight_hash
+    from .phase10 import V4_WEIGHT_SHA256, V6_WEIGHT_SHA256
+    from .phase12 import EPOCHS, TORCH_SEED, train_v7
+    from .schema import load_jsonl
+    from .tracked import FEATURE_VERSION_V7
+
+    if Path(args.out).resolve() in {Path(args.v6).resolve(), Path(args.v4).resolve()}:
+        raise SystemExit("refusing to overwrite a frozen checkpoint")
+    device = device_of(args.device)
+    source, _optimizer, payload = load_checkpoint(args.v6, device, expected_version="colonist_features_v6")
+    parent = _weight_hash(source)
+    if parent != V6_WEIGHT_SHA256:
+        raise SystemExit(f"v6 weight hash {parent} is not the frozen hash")
+    v4_model, _opt, _v4_payload = load_checkpoint(args.v4, device, expected_version="colonist_features_v4")
+    if _weight_hash(v4_model) != V4_WEIGHT_SHA256:
+        raise SystemExit("v4 weight hash changed")
+    original, _dropped = load_jsonl(args.original, held_out_seeds=set())
+    aggregated, _dropped_agg = load_jsonl(args.aggregated, held_out_seeds=set())
+    mixed = mix_corpora(original, aggregated)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def on_epoch(info: dict) -> None:
+        print(json.dumps({"event": "epoch", **info}, default=str), flush=True)
+
+    model, optimizer, trained = train_v7(mixed, source, device, epochs=int(args.epochs or EPOCHS), on_epoch=on_epoch)
+    manifest = {
+        "feature_version": FEATURE_VERSION_V7,
+        "candidate_id": "colonist_features_v7_longest_road",
+        "parent_checkpoint": args.v6,
+        "parent_sha256": parent,
+        "v4_sha256": V4_WEIGHT_SHA256,
+        "initialization": "v6 weights with zero-filled longest-road columns",
+        "epochs": int(args.epochs or EPOCHS),
+        "torch_seed": TORCH_SEED,
+        "learning_rate": 1e-3,
+        "loss": "unweighted_cross_entropy",
+        "original_rows": len(original),
+        "aggregated_rows": len(aggregated),
+        "train_seconds": trained["seconds"],
+        "final_loss": trained["loss"],
+        "ppo_authorized": False,
+        "external_colonist_games": 0,
+    }
+    save_checkpoint(str(out), model, optimizer, int(args.epochs or EPOCHS), TORCH_SEED, manifest)
+    if _weight_hash(source) != V6_WEIGHT_SHA256 or _weight_hash(v4_model) != V4_WEIGHT_SHA256:
+        raise SystemExit("frozen weights changed during training")
+    print(json.dumps({
+        "checkpoint": str(out),
+        "weight_sha256": _weight_hash(model),
+        "rows": trained["rows"],
+        "seconds": trained["seconds"],
+        "v4_unchanged": True,
+        "v6_unchanged": True,
+    }, indent=2))
+
+
+def cmd_match_v7(args: argparse.Namespace) -> None:
+    from .experiment import repo_root
+    from .phase12 import SMOKE_SEEDS, STRENGTH_SEEDS, run_strength
+    from .rl import SimulatorBridge
+    from .tracked import FEATURE_VERSION_V6, FEATURE_VERSION_V7
+
+    device = device_of(args.device)
+    v7_model, _o, v7_payload = load_checkpoint(args.v7, device, expected_version=FEATURE_VERSION_V7)
+    v6_model, _o2, _v6_payload = load_checkpoint(args.v6, device, expected_version=FEATURE_VERSION_V6)
+    from .match import _weight_hash
+    from .phase10 import V6_WEIGHT_SHA256
+
+    if _weight_hash(v6_model) != V6_WEIGHT_SHA256:
+        raise SystemExit("v6 weight hash changed")
+    seeds = SMOKE_SEEDS if args.smoke else STRENGTH_SEEDS
+    bridge = SimulatorBridge(repo_root())
+    try:
+        report = run_strength(bridge, {
+            "v7": {"model": v7_model, "checkpoint": args.v7, "version": FEATURE_VERSION_V7, "hash": _weight_hash(v7_model)},
+            "v6": {"model": v6_model, "checkpoint": args.v6, "version": FEATURE_VERSION_V6, "hash": _weight_hash(v6_model)},
+        }, device, seeds)
+    finally:
+        bridge.close()
+    report["v7_manifest_parent"] = (v7_payload.get("dataset_manifest") or {}).get("parent_sha256")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({
+        "decision": report["interpretation"]["decision"],
+        "reasons": report["interpretation"]["reasons"],
+        "v7_pairs": report["v7"]["pairs_completed"],
+        "v6_pairs": report["v6"]["pairs_completed"],
+        "out": args.out,
+    }, indent=2))
+
+
+def cmd_validate_config(args: argparse.Namespace) -> None:
+    from .local_job import validate_config
+
+    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    validate_config(config)
+    print(json.dumps({"ok": True, "kind": config["kind"], "out": config["out"]}, indent=2))
+
+
+def cmd_local_train(args: argparse.Namespace) -> None:
+    from .local_job import run_supervised
+
+    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    if config.get("kind") != "supervised":
+        raise SystemExit("local-train currently runs kind supervised. Use train-v7 for the longest-road candidate.")
+    result = run_supervised(config, resume=bool(args.resume), stop_after_epoch=args.stop_after_epoch)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_report(args: argparse.Namespace) -> None:
+    from .local_job import report
+
+    print(json.dumps(report(args.run), indent=2))
+
+
 def main() -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--device", default="cpu")
@@ -623,6 +751,7 @@ def main() -> None:
     evaluate = sub.add_parser("eval", parents=[common])
     evaluate.add_argument("--checkpoint", required=True)
     evaluate.add_argument("--out", required=True)
+    evaluate.add_argument("--seeds", default=None, help="Comma-separated eval seeds. Defaults to ml-holdout-0,ml-holdout-1.")
     evaluate.set_defaults(func=cmd_eval)
 
     experiment = sub.add_parser("experiment", parents=[common])
@@ -718,6 +847,36 @@ def main() -> None:
     eval_agg.add_argument("--control", required=True)
     eval_agg.add_argument("--out", required=True)
     eval_agg.set_defaults(func=cmd_eval_agg)
+
+    train_v7 = sub.add_parser("train-v7", parents=[common])
+    train_v7.add_argument("--v4", required=True)
+    train_v7.add_argument("--v6", required=True)
+    train_v7.add_argument("--original", required=True)
+    train_v7.add_argument("--aggregated", required=True)
+    train_v7.add_argument("--out", required=True)
+    train_v7.add_argument("--epochs", type=int, default=None)
+    train_v7.set_defaults(func=cmd_train_v7)
+
+    match_v7 = sub.add_parser("match-v7", parents=[common])
+    match_v7.add_argument("--v7", required=True)
+    match_v7.add_argument("--v6", required=True)
+    match_v7.add_argument("--out", required=True)
+    match_v7.add_argument("--smoke", action="store_true")
+    match_v7.set_defaults(func=cmd_match_v7)
+
+    validate_config = sub.add_parser("validate-config", parents=[common])
+    validate_config.add_argument("--config", required=True)
+    validate_config.set_defaults(func=cmd_validate_config)
+
+    local_train = sub.add_parser("local-train", parents=[common])
+    local_train.add_argument("--config", required=True)
+    local_train.add_argument("--resume", action="store_true")
+    local_train.add_argument("--stop-after-epoch", type=int, default=None)
+    local_train.set_defaults(func=cmd_local_train)
+
+    report = sub.add_parser("report", parents=[common])
+    report.add_argument("--run", required=True)
+    report.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
     args.func(args)

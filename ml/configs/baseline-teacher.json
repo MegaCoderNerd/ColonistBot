@@ -1,0 +1,28 @@
+{
+    "kind":  "supervised",
+    "data":  "data/ml/generated/baseline_teacher_100.jsonl",
+    "out":  "ml/runs/baseline-teacher",
+    "epochs":  8,
+    "batch_size":  64,
+    "seed":  17,
+    "learning_rate":  0.001,
+    "device":  "cpu",
+    "eval":  {
+                 "every_epochs":  2,
+                 "seeds":  [
+                               "ml-baseline-val-0",
+                               "ml-baseline-val-1",
+                               "ml-baseline-val-2",
+                               "ml-baseline-val-3",
+                               "ml-baseline-val-4",
+                               "ml-baseline-val-5",
+                               "ml-baseline-val-6",
+                               "ml-baseline-val-7",
+                               "ml-baseline-val-8",
+                               "ml-baseline-val-9"
+                           ],
+                 "vp":  10,
+                 "max_turns":  70,
+                 "max_actions":  450
+             }
+}

@@ -11,6 +11,43 @@ from .model import PolicyValueNet
 from .protocol import EVAL_RULES, MIN_PAIRS_TO_ADOPT
 from .rl import EVAL_SEEDS, SimulatorBridge, play_game
 
+# Namespaces already used to train or to choose a model. Fresh eval seeds must stay outside them.
+# ml-holdout- is the default evaluation pair for this command, so it is not in this list.
+# ml-overnight-0 and ml-overnight-1 are the documented overnight training export, not the final eval range.
+TRAINING_OR_SELECTION_PREFIXES = (
+    "ml-phase6-",
+    "ml-fidelity-",
+    "ml-graph-",
+    "ml-rl-",
+    "ml-v4-match-",
+    "ml-v4-agg-",
+    "ml-v6-final-",
+    "ml-v6-strength-",
+    "ml-v7-strength-",
+    "ml-cutoff-probe-",
+)
+OVERNIGHT_TRAIN_SEEDS = frozenset({"ml-overnight-0", "ml-overnight-1"})
+
+
+def parse_eval_seeds(raw: str | None) -> tuple[str, ...] | None:
+    """Parse a comma-separated eval seed list. None keeps the default holdout pair."""
+    if raw is None:
+        return None
+    return validate_eval_seeds(part.strip() for part in str(raw).split(","))
+
+
+def validate_eval_seeds(seeds) -> tuple[str, ...]:
+    parsed = tuple(str(seed) for seed in seeds)
+    if not parsed or any(seed == "" for seed in parsed):
+        raise ValueError("eval seeds must be a nonempty comma-separated list")
+    if len(parsed) != len(set(parsed)):
+        duplicates = sorted({seed for seed in parsed if parsed.count(seed) > 1})
+        raise ValueError(f"eval seeds must be unique: {duplicates}")
+    for seed in parsed:
+        if seed in OVERNIGHT_TRAIN_SEEDS or any(seed.startswith(prefix) for prefix in TRAINING_OR_SELECTION_PREFIXES):
+            raise ValueError(f"eval seed {seed} reuses a training or model-selection namespace")
+    return parsed
+
 
 def _margin(terminal: dict, learner: str):
     scores = terminal.get("scores") or {}

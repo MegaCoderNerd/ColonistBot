@@ -130,6 +130,12 @@ def select_legal(model: PolicyValueNet, observation: dict, device: torch.device,
         global_x, candidates, ids = encode_observation_v6(observation, device)
         if global_x.numel() != GLOBAL_DIM_V4 or candidates.size(1) != CANDIDATE_DIM_V6:
             raise RuntimeError("feature width does not match colonist_features_v6")
+    elif version == "colonist_features_v7":
+        from .longest import LONGEST_ROAD_DIM, encode_observation_v7
+
+        global_x, candidates, ids = encode_observation_v7(observation, device)
+        if global_x.numel() != GLOBAL_DIM_V4 + 2 or candidates.size(1) != CANDIDATE_DIM_V6 + LONGEST_ROAD_DIM:
+            raise RuntimeError("feature width does not match colonist_features_v7")
     else:
         raise RuntimeError(f"unsupported feature schema {version}")
     with torch.inference_mode():

@@ -80,6 +80,52 @@ That command uses `ml-holdout-0` and `ml-holdout-1`. It is not the 200-seed meas
 
 Use the same `--vp`, `--max-turns`, and `--max-actions` for self-play and eval when you compare them. The smoke default is 3 victory points, 20 turns, and 120 actions. A 4-point, 8-turn export of six games completed none of them, so that horizon does not produce an outcome target. These knobs are not the 10 victory-point, 70-turn benchmark.
 
+## Overnight CPU training
+
+Run these from the repository root. `PYTHONPATH` must include `ml`. Python 3.10 is the interpreter that has the installed PyTorch build. The commands below use CPU. `--device cuda` is accepted only when that build reports a GPU; the configs here set `"device": "cpu"`.
+
+The overnight config is `ml/configs/overnight-supervised.json`: 8 epochs, batch 64, seed 7, learning rate 0.001, output `ml/runs/overnight`. Every 2 epochs it plays frozen `baseline_heuristic_v1` on `ml-holdout-0` and `ml-holdout-1`, both seats, at 3 victory points, 20 turns, and 80 actions. Those two seeds are rejected if they appear in the training file. Change `epochs`, `batch_size`, the export `--seeds`, `--vp`, `--max-turns`, and `--max-actions` in the config when you want a longer or shorter job. Do not point `out` at `ml/runs/phase6/summary_v4.pt` or `ml/runs/phase9/road_v6.pt`.
+
+```powershell
+$env:PYTHONPATH = "ml"
+npm run ml:engine -- export --out data/ml/generated/overnight_train.jsonl --seeds ml-overnight-0,ml-overnight-1 --vp 3 --max-turns 20 --max-actions 80
+py -3.10 -m colonist_ml.cli validate-config --config ml/configs/overnight-supervised.json
+py -3.10 -m colonist_ml.cli local-train --config ml/configs/overnight-supervised.json
+```
+
+That export and the validate command were run. The 8-epoch job was not started. The same command with the smaller `ml/configs/pipeline-smoke.json` was started, stopped after epoch 1, and resumed through epoch 2.
+
+Progress is `ml/runs/overnight/status.jsonl`, one JSON object per line. An `epoch` line has the loss, the policy loss, the value loss, `optimizer_steps`, `weight_sha256`, `checkpoint_sha256`, and `previous_sha256`. An `eval` line has games, completed games, incomplete games, cutoff reasons, wins, and losses. `py -3.10 -m colonist_ml.cli report --run ml/runs/overnight` prints the last line and whether the checkpoints exist.
+
+`latest.pt` is the newest epoch. `best.pt` is the lowest loss so far. `latest.pt.prev` is the checkpoint from the previous successful save. Each write goes to a temporary file and then replaces the target. A failed write leaves the previous file in place. The value loss uses `actor_win` only when `completion_status` is `completed`. A cutoff stays `incomplete`, keeps `actor_win` null, and is not a loss.
+
+Stop after the current epoch by creating `ml/runs/overnight/STOP`. Ctrl+C sets the same flag, which the loop reads before the next epoch. Both leave `latest.pt` from the last finished epoch. Resume only after deleting `STOP`, with the same config:
+
+```powershell
+Remove-Item ml/runs/overnight/STOP -ErrorAction SilentlyContinue
+py -3.10 -m colonist_ml.cli local-train --config ml/configs/overnight-supervised.json --resume
+py -3.10 -m colonist_ml.cli report --run ml/runs/overnight
+```
+
+Resume loads the model, the Adam state, the epoch, and the Torch RNG state saved at the last epoch boundary. The next epoch reads the training file from the beginning again. A batch that was in progress when the process died is not continued mid-batch. On the fixture, an interrupted 3-epoch run and an uninterrupted 3-epoch run finished with the same weight hash. That match is for this CPU update at epoch boundaries. It is not a claim about a kill during `optimizer.step`.
+
+The bounded run that was executed is:
+
+```powershell
+$env:PYTHONPATH = "ml"
+npm run ml:engine -- export --out data/ml/generated/overnight_smoke.jsonl --seeds ml-overnight-0,ml-overnight-1 --vp 3 --max-turns 12 --max-actions 40
+py -3.10 -m colonist_ml.cli validate-config --config ml/configs/pipeline-smoke.json
+py -3.10 -m colonist_ml.cli local-train --config ml/configs/pipeline-smoke.json --stop-after-epoch 1
+py -3.10 -m colonist_ml.cli local-train --config ml/configs/pipeline-smoke.json --resume
+py -3.10 -m colonist_ml.cli report --run ml/runs/pipeline-smoke
+```
+
+Epoch 1 stopped with optimizer step 17. Resume finished epoch 2 at step 34 with a different weight hash. `latest.pt.prev` matched the epoch-1 checkpoint hash. Eval played 4 games against `baseline_heuristic_v1`: 3 completed, 1 `max_turns_reached` cutoff, 0 wins. The training seeds were `ml-overnight-0` and `ml-overnight-1`. The eval seeds were `ml-holdout-0` and `ml-holdout-1`. The report is `ml/runs/pipeline-smoke/eval.json`. This smoke is not a strength result.
+
+A labeled action that is absent from that position's legal list raises before the optimizer step. Eval scores only the legal candidate list and rejects an index outside it.
+
+The separate v7 training and 800-game match commands are in `docs/ml/phase12-protocol.md`. They are not the overnight loop, and that match is not rerun from here.
+
 ## Tests
 
 ```powershell

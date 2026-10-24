@@ -10,8 +10,7 @@
  * recordings on one side of any split.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { loadRecordingCorpus, recordingsStrict, resolveRecordingCorpusPath } from "../recordings/load";
 import type { ResourceHand } from "../types";
 import type { ActionDevCardKind, ConcreteDevCardKind, ConcreteSimulatedGameState } from "../engine/state";
 import { decodeFrames } from "../decode";
@@ -41,26 +40,19 @@ export const DEFAULT_RECORDINGS_PATH_CANDIDATES: readonly string[] = [
 ];
 
 export function resolveRecordingsPath(rootDir: string): string | undefined {
-  const fromEnv = process.env.COLONIST_RECORDINGS_PATH;
-  if (fromEnv && existsSync(fromEnv)) return fromEnv;
-  for (const candidate of DEFAULT_RECORDINGS_PATH_CANDIDATES) {
-    const full = resolve(rootDir, candidate);
-    if (existsSync(full)) return full;
-  }
-  return undefined;
+  return resolveRecordingCorpusPath(rootDir);
 }
 
 export function loadRecordings(rootDir: string): {
   path: string | undefined;
   recordings: Recording[];
 } {
-  const path = resolveRecordingsPath(rootDir);
-  if (!path) return { path: undefined, recordings: [] };
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as { recordings?: Recording[] };
-    return { path, recordings: raw.recordings ?? [] };
-  } catch {
-    return { path, recordings: [] };
+    const corpus = loadRecordingCorpus(rootDir);
+    return { path: corpus.path, recordings: [...corpus.recordings] };
+  } catch (error) {
+    if (recordingsStrict()) throw error;
+    return { path: undefined, recordings: [] };
   }
 }
 

@@ -16,6 +16,7 @@ from .features import GLOBAL_DIM, global_vector
 FEATURE_VERSION_V4 = "colonist_features_v4"
 FEATURE_VERSION_V5 = "colonist_features_v5"
 FEATURE_VERSION_V6 = "colonist_features_v6"
+FEATURE_VERSION_V7 = "colonist_features_v7"
 RESOURCES = ("lumber", "brick", "wool", "grain", "ore")
 # Two opponents: five known resources, unnamed cards, and an exactness flag. Then the bank flag.
 TRACKED_EXTRA = 2 * (len(RESOURCES) + 2) + 1

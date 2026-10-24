@@ -13,6 +13,7 @@ import { RESOURCES, type Resource } from "../types";
 import type { ConcreteSimulatedGameState } from "../engine/state";
 import type { SimulatedAction } from "../engine/transition";
 import { type PublicResourceLedger, type TrackedResources } from "./ledger";
+import { longestRoadFeaturesForAction } from "./longest-road-features";
 import { roadExpansionForAction } from "./road-features";
 
 export const OBSERVATION_VERSION = "colonist_observation_v2";
@@ -67,6 +68,17 @@ export interface ActionPublicFeatures {
   readonly opens_settlement: number;
   readonly newly_opened: number;
   readonly connects_network: number;
+  /**
+   * Zero on non-roads. On a road, exactly one award flag is 1.
+   * Lengths are the engine walk, not a teacher label.
+   */
+  readonly road_length_now: number;
+  readonly road_length_after: number;
+  readonly road_length_delta: number;
+  readonly longest_road_gain: number;
+  readonly longest_road_retain: number;
+  readonly longest_road_lose: number;
+  readonly longest_road_otherwise: number;
 }
 
 export interface LegalCandidate {
@@ -111,6 +123,9 @@ export interface ColonistObservation {
     readonly settlements_left: number;
     readonly cities_left: number;
     readonly roads_left: number;
+    /** Public route length from the engine walk. Kept when the summary drops the board. */
+    readonly road_length: number;
+    readonly has_longest_road: boolean;
   };
   readonly opponents: Array<{
     readonly id: string;
@@ -346,7 +361,8 @@ function publicActionFeatures(state: ConcreteSimulatedGameState, action: Simulat
     cost_wool: cost.wool,
     cost_grain: cost.grain,
     cost_ore: cost.ore,
-    ...roadExpansionForAction(state, actorId, action)
+    ...roadExpansionForAction(state, actorId, action),
+    ...longestRoadFeaturesForAction(state, actorId, action)
   };
 }
 
@@ -464,7 +480,9 @@ export function toObservation(
       public_vp: actor.visibleVp,
       settlements_left: actor.settlementsLeft,
       cities_left: actor.citiesLeft,
-      roads_left: actor.roadsLeft
+      roads_left: actor.roadsLeft,
+      road_length: actor.roadLength,
+      has_longest_road: actor.hasLongestRoad
     },
     opponents: state.players
       .filter((player) => player.id !== actorId)

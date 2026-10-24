@@ -1,4 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { decodeFrames } from "../src/analyzer/decode";
@@ -21,19 +20,13 @@ import { bagState } from "../src/analyzer/engine/value";
 import { planTurn, playableCardsOf, roadBattle } from "../src/analyzer/engine/decide";
 import { act, buyDev, endTurn, newPlayer, playDev, race, updateLargestArmy } from "../src/analyzer/engine/sim";
 import type { Board, Placements } from "../src/analyzer/types";
-import type { Recording } from "../src/shared/schema";
+import { loadRecordingCorpus, requireRecording } from "../src/analyzer/recordings/load";
 
-const RECORDINGS_PATH =
-  process.env.COLONIST_RECORDINGS_PATH ??
-  [resolve(__dirname, "../fixtures/colonist-recordings.json"), resolve(__dirname, "../colonist-recordings.json")].find(
-    (path) => existsSync(path)
-  );
-const recordingsAvailable = RECORDINGS_PATH !== undefined && existsSync(RECORDINGS_PATH);
+const recordings = loadRecordingCorpus(resolve(__dirname, "..")).recordings;
+const recordingsAvailable = recordings.length > 0;
 
-function loadRecordings(): Recording[] {
-  if (!RECORDINGS_PATH || !existsSync(RECORDINGS_PATH)) return [];
-  const raw = JSON.parse(readFileSync(RECORDINGS_PATH, "utf8")) as { recordings: Recording[] };
-  return raw.recordings;
+function loadRecordings() {
+  return recordings;
 }
 
 describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
@@ -79,7 +72,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
 
     it.skipIf(!recordingsAvailable)("reconciles live PlayerSnapshot visibleVp, hiddenVp, and vp across edge9896, farm9373, and deck7708 (recording fixture required)", () => {
       // 1. edge9896
-      const edge = recordings.find((r) => r.id === "edge9896")!;
+      const edge = requireRecording(recordings, "edge9896");
       const edgeParsed = stateDiffAdapter.parse(decodeFrames(edge.frames).decoded);
       const edgeP1 = edgeParsed.snapshot!.players.find((p) => p.id === "c1")!;
       const edgeP5 = edgeParsed.snapshot!.players.find((p) => p.id === "c5")!;
@@ -103,7 +96,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
       });
 
       // 2. farm9373
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const farmParsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const farmP1 = farmParsed.snapshot!.players.find((p) => p.id === "c1")!;
       const farmP5 = farmParsed.snapshot!.players.find((p) => p.id === "c5")!;
@@ -127,7 +120,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
       });
 
       // 3. deck7708
-      const deck = recordings.find((r) => r.id === "deck7708")!;
+      const deck = requireRecording(recordings, "deck7708");
       const deckParsed = stateDiffAdapter.parse(decodeFrames(deck.frames).decoded);
       const deckP1 = deckParsed.snapshot!.players.find((p) => p.id === "c1")!;
       const deckP5 = deckParsed.snapshot!.players.find((p) => p.id === "c5")!;
@@ -152,7 +145,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
     });
 
     it.skipIf(!recordingsAvailable)("emits weighted vp events during stateDiffAdapter.parse rather than raw unweighted counts (recording fixture required)", () => {
-      const deck = recordings.find((r) => r.id === "deck7708")!;
+      const deck = requireRecording(recordings, "deck7708");
       const deckParsed = stateDiffAdapter.parse(decodeFrames(deck.frames).decoded);
       const p5VpEvents = deckParsed.events.filter((e) => e.type === "vp" && e.player === "c5");
       expect(p5VpEvents.at(-1)).toMatchObject({ type: "vp", player: "c5", vp: 15 });
@@ -215,7 +208,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
 
   describe("3. [ACCEPTANCE — Step 2.1] Authoritative Game Settings & Unknown Preservation", () => {
     it.skipIf(!recordingsAvailable)("extracts authoritative gameSettings from initial state frames and preserves unknown settings as undefined (recording fixture required)", () => {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const { decoded } = decodeFrames(farm.frames);
       const parsed = stateDiffAdapter.parse(decoded);
 
@@ -298,8 +291,12 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
     });
 
     it.skipIf(!recordingsAvailable)("prevents planTurn from recommending playing Road Building on the same turn it was bought (recording fixture required)", () => {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
-      const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
+      const farm = requireRecording(recordings, "farm9373");
+      // The final snapshot still has road pieces and a playable Road Building card,
+      // but no settlement worth two roads. Frame 200 of the same game is a main-phase
+      // prefix where the existing coach does recommend the card. Same-turn purchase
+      // stays illegal on that prefix.
+      const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames.slice(0, 200)).decoded);
       const placements = placementsFrom(parsed.events);
       const me = parsed.selfId ?? parsed.players[0].id;
       const snap = parsed.snapshot!;
@@ -316,7 +313,8 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
                 unknownDevsInHand: 0,
                 devCards: ["roadBuilding" as const],
                 devsBoughtThisTurn: ["roadBuilding" as const],
-                playableDevCards: undefined
+                playableDevCards: undefined,
+                hasUsedDevThisTurn: true
               }
             : p
         )
@@ -343,7 +341,8 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
                 unknownDevsInHand: 0,
                 devCards: ["roadBuilding" as const],
                 devsBoughtThisTurn: undefined,
-                playableDevCards: ["roadBuilding" as const]
+                playableDevCards: ["roadBuilding" as const],
+                hasUsedDevThisTurn: undefined
               }
             : p
         )
@@ -411,7 +410,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
       expect(splitRes.ends).not.toContain("c2");
 
       // On a real board, verify networkLength and longestExtensions respect opponent settlement road splits
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
       const board = parsed.board!;
       const ctx = contextFor(board);
@@ -463,7 +462,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
         ["farm9373", { c1: 13, c5: 4 }],
         ["deck7708", { c1: 8 }]
       ] as const) {
-        const rec = recordings.find((r) => r.id === id)!;
+        const rec = requireRecording(recordings, id);
         const parsed = stateDiffAdapter.parse(decodeFrames(rec.frames).decoded);
         const placements = placementsFrom(parsed.events);
         for (const [pid, len] of Object.entries(expected)) {
@@ -477,7 +476,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
 
   describe.skipIf(!recordingsAvailable)("6. [ACCEPTANCE — Step 2.3] Settlement Distance & Legal Road Placement (recording fixture required)", () => {
     if (!recordingsAvailable) return;
-    const farm = recordings.find((r) => r.id === "farm9373")!;
+    const farm = requireRecording(recordings, "farm9373");
     const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
     const board: Board = parsed.board!;
     const ctx = contextFor(board);
@@ -542,7 +541,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
 
   describe("7. [ACCEPTANCE — Step 2.4] Dice Roll Extraction, Balanced Deck Cycle, and Game-Log Parser Corrections", () => {
     it.skipIf(!recordingsAvailable)("verifies 100% roll sequence agreement between WebSocket diceState and LogParser (75 rolls in farm9373) and 36-card Balanced Dice cycle (recording fixture required)", () => {
-      const farm = recordings.find((r) => r.id === "farm9373")!;
+      const farm = requireRecording(recordings, "farm9373");
       const { decoded } = decodeFrames(farm.frames);
       const stateParsed = stateDiffAdapter.parse(decoded);
       const wsRolls = stateParsed.events.filter((e) => e.type === "roll");
@@ -688,7 +687,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
 
       // Verify full Rush-mode recordings (path4053, hand179) and bot-takeover recordings (play277, steal1277, road5055)
       for (const id of ["path4053", "hand179", "play277", "steal1277", "road5055"]) {
-        const rec = recordings.find((r) => r.id === id)!;
+        const rec = requireRecording(recordings, id);
         const parser = new LogParser(rec.meta.me);
         for (const entry of rec.log) {
           if (entry.text) parser.push(entry);
@@ -702,7 +701,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
       }
 
       // Specifically check road5055 and deck7708 end-to-end log parsing for bot actions, road transfer, and gameEnd
-      const deck = recordings.find((r) => r.id === "deck7708")!;
+      const deck = requireRecording(recordings, "deck7708");
       const deckParser = new LogParser(deck.meta.me);
       for (const entry of deck.log) {
         if (entry.text) deckParser.push(entry);
@@ -793,7 +792,7 @@ describe("Stage 2 — Acceptance Tests (Steps 2.1–2.5 Implemented)", () => {
   });
   describe.skipIf(!recordingsAvailable)("8. [ACCEPTANCE — Step 2.5] Robber Rules, Simulator Largest Army Transfers & Dev-Card Timing (recording fixture required)", () => {
     if (!recordingsAvailable) return;
-    const farm = recordings.find((r) => r.id === "farm9373")!;
+    const farm = requireRecording(recordings, "farm9373");
     const parsed = stateDiffAdapter.parse(decodeFrames(farm.frames).decoded);
     const board: Board = parsed.board!;
     const ctx = contextFor(board);

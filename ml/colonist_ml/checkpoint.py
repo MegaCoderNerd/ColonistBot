@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 import torch
 
-from .features import FEATURE_VERSION
+from .features import CANDIDATE_DIM, FEATURE_VERSION
 from .graph import GRAPH_FEATURE_VERSION, GraphPolicyValueNet
+from .longest import GLOBAL_LONGEST_DIM, LONGEST_ROAD_DIM
 from .model import PolicyValueNet
-from .features import CANDIDATE_DIM
 from .roads import ROAD_EXPANSION_DIM
-from .tracked import FEATURE_VERSION_V4, FEATURE_VERSION_V5, FEATURE_VERSION_V6, GLOBAL_DIM_V4
+from .tracked import FEATURE_VERSION_V4, FEATURE_VERSION_V5, FEATURE_VERSION_V6, FEATURE_VERSION_V7, GLOBAL_DIM_V4
 
 CHECKPOINT_V1 = "colonist_checkpoint_v1"
 CHECKPOINT_V2 = "colonist_checkpoint_v2"
@@ -33,13 +35,13 @@ def save_checkpoint(
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     version = getattr(model, "feature_version", FEATURE_VERSION)
-    observation_version = "colonist_observation_v2" if version in (FEATURE_VERSION_V4, FEATURE_VERSION_V5, FEATURE_VERSION_V6) else "colonist_observation_v1"
-    torch.save(
-        {
+    observation_version = "colonist_observation_v2" if version in (FEATURE_VERSION_V4, FEATURE_VERSION_V5, FEATURE_VERSION_V6, "colonist_features_v7") else "colonist_observation_v1"
+    payload = {
             "schema_version": CHECKPOINT_V2,
             "observation_version": observation_version,
             "feature_version": version,
             "candidate_dim": int(getattr(model, "candidate_dim", CANDIDATE_DIM)),
+            "global_dim": int(getattr(model, "global_dim", GLOBAL_DIM_V4)),
             "hidden": model.hidden,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -52,16 +54,21 @@ def save_checkpoint(
             "decisions_used": decisions_used,
             "torch_rng_state": torch.get_rng_state(),
             "dataset_manifest": manifest,
-        },
-        target,
-    )
+        }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    torch.save(payload, temporary)
+    if target.exists():
+        shutil.copy2(target, target.with_name(target.name + ".prev"))
+    os.replace(temporary, target)
 
 
-def load_checkpoint(path: str, device: torch.device, restore_rng: bool = False) -> tuple[PolicyValueNet, torch.optim.Optimizer, dict]:
+def load_checkpoint(path: str, device: torch.device, restore_rng: bool = False, expected_version: str | None = None) -> tuple[PolicyValueNet, torch.optim.Optimizer, dict]:
     payload = torch.load(path, map_location=device)
     if payload.get("schema_version") not in (CHECKPOINT_V1, CHECKPOINT_V2):
         raise ValueError("checkpoint schema")
     version = payload.get("feature_version")
+    if expected_version is not None and version != expected_version:
+        raise ValueError(f"checkpoint is {version}, not {expected_version}")
     hidden = int(payload.get("hidden", 64))
     if version == GRAPH_FEATURE_VERSION:
         model = GraphPolicyValueNet(hidden=hidden).to(device)
@@ -76,6 +83,14 @@ def load_checkpoint(path: str, device: torch.device, restore_rng: bool = False) 
         if width != CANDIDATE_DIM + ROAD_EXPANSION_DIM:
             raise ValueError(f"colonist_features_v6 candidate width {width} is not {CANDIDATE_DIM + ROAD_EXPANSION_DIM}")
         model = PolicyValueNet(hidden=hidden, global_dim=GLOBAL_DIM_V4, feature_version=FEATURE_VERSION_V6, candidate_dim=width).to(device)
+    elif version == FEATURE_VERSION_V7:
+        width = int(payload.get("candidate_dim", CANDIDATE_DIM + ROAD_EXPANSION_DIM + LONGEST_ROAD_DIM))
+        global_dim = int(payload.get("global_dim", GLOBAL_DIM_V4 + GLOBAL_LONGEST_DIM))
+        expected_width = CANDIDATE_DIM + ROAD_EXPANSION_DIM + LONGEST_ROAD_DIM
+        expected_global = GLOBAL_DIM_V4 + GLOBAL_LONGEST_DIM
+        if width != expected_width or global_dim != expected_global:
+            raise ValueError(f"colonist_features_v7 width {width} global {global_dim} is not {expected_width} by {expected_global}")
+        model = PolicyValueNet(hidden=hidden, global_dim=global_dim, feature_version=FEATURE_VERSION_V7, candidate_dim=width).to(device)
     else:
         raise ValueError("checkpoint features")
     candidate_weight = payload["model"].get("candidate_encoder.weight")

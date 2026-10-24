@@ -1,0 +1,28 @@
+{
+  "kind": "supervised",
+  "data": "data/ml/generated/overnight_train.jsonl",
+  "out": "ml/runs/overnight",
+  "epochs": 8,
+  "batch_size": 64,
+  "seed": 7,
+  "learning_rate": 0.001,
+  "device": "cpu",
+  "eval": {
+    "every_epochs": 2,
+    "seeds": [
+      "ml-overnight-eval-0",
+      "ml-overnight-eval-1",
+      "ml-overnight-eval-2",
+      "ml-overnight-eval-3",
+      "ml-overnight-eval-4",
+      "ml-overnight-eval-5",
+      "ml-overnight-eval-6",
+      "ml-overnight-eval-7",
+      "ml-overnight-eval-8",
+      "ml-overnight-eval-9"
+    ],
+    "vp": 10,
+    "max_turns": 70,
+    "max_actions": 450
+  }
+}

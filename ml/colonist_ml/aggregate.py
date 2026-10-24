@@ -495,7 +495,7 @@ def label_counts(path: str) -> dict:
     return {"rows": rows, "teacher_types": dict(counts)}
 
 
-def _start_payload(seed: str, learner: str, checkpoint: str) -> dict:
+def _start_payload(seed: str, learner: str, checkpoint: str, detail: str = "summary") -> dict:
     return {
         "cmd": "start",
         "seed": seed,
@@ -506,15 +506,15 @@ def _start_payload(seed: str, learner: str, checkpoint: str) -> dict:
         "maxTurns": MATCH_LIMITS["maxTurns"],
         "maxActions": MATCH_LIMITS["maxActions"],
         "checkpoint": checkpoint,
-        "detail": "summary",
+        "detail": detail,
     }
 
 
-def collect_game(bridge, model: PolicyValueNet, device: torch.device, seed: str, learner: str, checkpoint: str, checkpoint_hash: str) -> dict:
+def collect_game(bridge, model: PolicyValueNet, device: torch.device, seed: str, learner: str, checkpoint: str, checkpoint_hash: str, detail: str = "summary") -> dict:
     if getattr(model, "feature_version", "") != FEATURE_VERSION_V4:
         raise RuntimeError("aggregation refuses a checkpoint that is not colonist_features_v4")
     model.eval()
-    reply = bridge.request(_start_payload(seed, learner, checkpoint))
+    reply = bridge.request(_start_payload(seed, learner, checkpoint, detail))
     pending = []
     while reply.get("type") == "decision":
         observation = reply["observation"]
@@ -578,7 +578,7 @@ def write_jsonl(path: str, examples: list[dict]) -> None:
             handle.write(json.dumps(example, separators=(",", ":")) + "\n")
 
 
-def collect_split(bridge, model, device, checkpoint: str, split: str, out_path: str) -> dict:
+def collect_split(bridge, model, device, checkpoint: str, split: str, out_path: str, detail: str = "summary") -> dict:
     seeds = seeds_for(split)
     assert_agg_seeds(seeds, split)
     checkpoint_hash = _weight_hash(model)
@@ -587,7 +587,7 @@ def collect_split(bridge, model, device, checkpoint: str, split: str, out_path: 
     started = time.perf_counter()
     for seed in seeds:
         for learner in ("c1", "c2"):
-            played = collect_game(bridge, model, device, seed, learner, checkpoint, checkpoint_hash)
+            played = collect_game(bridge, model, device, seed, learner, checkpoint, checkpoint_hash, detail=detail)
             examples.extend(played["examples"])
             terminal = played["terminal"]
             games.append(
