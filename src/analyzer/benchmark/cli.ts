@@ -14,6 +14,8 @@
  *   npm run benchmark:policy -- --city-trade-check # rejected partial-trade trial, both seed sets
  *   npm run benchmark:policy -- --devcard-rule development
  *   npm run benchmark:policy -- --devcard-rule holdout
+ *   npm run benchmark:policy -- --search-smoke
+ *   npm run benchmark:policy -- --search-screen --trials 20
  */
 
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -36,6 +38,7 @@ import {
   developmentSeedList,
   formatDevCardComparison
 } from "./devcard-rule";
+import { formatSearchScreen, runSearchScreen } from "./search-screen";
 
 interface CliArgs {
   readonly jsonPath?: string;
@@ -46,6 +49,8 @@ interface CliArgs {
   readonly progressDiag: boolean;
   readonly cityTradeCheck: boolean;
   readonly devcardRule?: "development" | "holdout" | "both";
+  readonly searchSmoke: boolean;
+  readonly searchScreen: boolean;
 }
 
 function parseArgs(argv: readonly string[]): CliArgs {
@@ -57,6 +62,8 @@ function parseArgs(argv: readonly string[]): CliArgs {
   let progressDiag = false;
   let cityTradeCheck = false;
   let devcardRule: "development" | "holdout" | "both" | undefined;
+  let searchSmoke = false;
+  let searchScreen = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -78,14 +85,47 @@ function parseArgs(argv: readonly string[]): CliArgs {
     } else if (arg === "--devcard-rule" && i + 1 < argv.length) {
       const stage = argv[++i];
       if (stage === "development" || stage === "holdout" || stage === "both") devcardRule = stage;
+    } else if (arg === "--search-smoke") {
+      searchSmoke = true;
+    } else if (arg === "--search-screen") {
+      searchScreen = true;
     }
   }
-  return { ...(jsonPath !== undefined ? { jsonPath } : {}), ...(trials !== undefined ? { trials } : {}), ...(seed !== undefined ? { seed } : {}), noSweep, raceTune, progressDiag, cityTradeCheck, ...(devcardRule !== undefined ? { devcardRule } : {}) };
+  return { ...(jsonPath !== undefined ? { jsonPath } : {}), ...(trials !== undefined ? { trials } : {}), ...(seed !== undefined ? { seed } : {}), noSweep, raceTune, progressDiag, cityTradeCheck, ...(devcardRule !== undefined ? { devcardRule } : {}), searchSmoke, searchScreen };
 }
 
 function main(): void {
   const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.searchSmoke || args.searchScreen) {
+    const trials = args.trials ?? (args.searchSmoke ? 1 : 20);
+    const prefix = args.seed ?? (args.searchSmoke ? "search-smoke" : "search-screen");
+    const seeds = Array.from({ length: trials }, (_, index) => `${prefix}-${index}`);
+    const smoke = args.searchSmoke && !args.searchScreen;
+    const report = runSearchScreen({
+      seeds,
+      rootK: smoke ? 4 : 8,
+      rolloutsPerCandidate: smoke ? 4 : 16,
+      maxSimulatedTurns: smoke ? 8 : 70,
+      maxSimulatedActions: smoke ? 40 : 450,
+      victoryPointsToWin: 15,
+      maxTurns: smoke ? 8 : 70,
+      maxActions: smoke ? 40 : 450,
+      masterSeed: smoke ? "search-v1-smoke" : "search-v1",
+      label: smoke
+        ? "Stage A plumbing smoke. 4 candidates x 4 rollouts. Not strength evidence."
+        : "Stage B strength screen. 8 candidates x 16 rollouts against baseline_heuristic_v1."
+    });
+    process.stdout.write(formatSearchScreen(report) + "\n");
+    if (args.jsonPath) {
+      const outPath = resolve(process.cwd(), args.jsonPath);
+      mkdirSync(dirname(outPath), { recursive: true });
+      writeFileSync(outPath, JSON.stringify({ ...report, trials: report.trials }, null, 2) + "\n", "utf8");
+      process.stdout.write(`\nJSON report written to ${outPath}\n`);
+    }
+    return;
+  }
 
   if (args.devcardRule) {
     const runDevelopment = args.devcardRule === "development" || args.devcardRule === "both";

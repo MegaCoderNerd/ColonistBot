@@ -1,0 +1,10 @@
+[package]
+name = "alphabot-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Calls the unmodified Eli6th/catan-rl AlphaBot. Does not reimplement search or inference."
+
+[dependencies]
+catan-core = { path = "../../../catan-rl/rust/catan-core" }
+catan-env = { path = "../../../catan-rl/rust/catan-env" }

@@ -545,6 +545,165 @@ export function devCardResourceCost(): { ore: number; grain: number } {
   return { ore: COST_DEV.ore ?? 0, grain: COST_DEV.grain ?? 0 };
 }
 
+/** Stable identity for a legal action. It does not include hidden state. */
+export function actionIdentity(action: SimulatedAction): string {
+  switch (action.type) {
+    case "placeSetupSettlement":
+    case "buildSettlement":
+    case "buildCity":
+      return `${action.type}:${action.cornerIndex}`;
+    case "placeSetupRoad":
+    case "buildRoad":
+    case "placeFreeRoad":
+      return `${action.type}:${action.edgeIndex}`;
+    case "rollDice":
+      return "rollDice";
+    case "discard":
+      return `discard:${RESOURCES.map((resource) => action.cards[resource] ?? 0).join(".")}`;
+    case "moveRobber":
+      return `moveRobber:${action.hexIndex}:${action.victimId ?? ""}`;
+    case "playYearOfPlenty":
+      return `playYearOfPlenty:${[...action.resources].join("+")}`;
+    case "playMonopoly":
+      return `playMonopoly:${action.resource}`;
+    case "bankTrade":
+      return `bankTrade:${action.give}:${action.giveCount ?? 4}:${action.receive}:${action.receiveCount ?? 1}`;
+    default:
+      return action.type;
+  }
+}
+
+/**
+ * Numeric rank used only to order legal alternatives for offline search.
+ * `baseline_heuristic_v1` still selects through `selectAction` and does not read this score.
+ * The score uses the same public board and own-hand helpers as that policy.
+ */
+export function heuristicActionScore(
+  state: ConcreteSimulatedGameState,
+  actorId: string,
+  action: SimulatedAction,
+  context: RolloutPolicyContext
+): number {
+  const actor = state.players.find((player) => player.id === actorId);
+  if (!actor) return -1e9;
+  switch (action.type) {
+    case "placeSetupSettlement":
+      return 1000 + scoreCornerForPlayer(state, action.cornerIndex, actorId);
+    case "placeSetupRoad": {
+      const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 2);
+      const base = (3 - Math.min(3, reach.dist)) * 5 + reach.bestCornerScore * 0.2;
+      return raceScore(state, actorId, reach, base, false).score;
+    }
+    case "rollDice":
+      return 5000;
+    case "playKnight": {
+      if (state.phase === "pre_roll") {
+        const robberHex = state.topology.hexes[state.robberHexIndex];
+        const blocksActor = robberHex?.cornerIndices.some((corner) => state.cornerOwner[corner] === actorId) ?? false;
+        return blocksActor ? 4500 : 50;
+      }
+      return 700;
+    }
+    case "discard": {
+      const remaining: ResourceHand = {
+        lumber: actor.hand.lumber - (action.cards.lumber ?? 0),
+        brick: actor.hand.brick - (action.cards.brick ?? 0),
+        wool: actor.hand.wool - (action.cards.wool ?? 0),
+        grain: actor.hand.grain - (action.cards.grain ?? 0),
+        ore: actor.hand.ore - (action.cards.ore ?? 0)
+      };
+      const canCity = actor.citiesLeft > 0 && getLegalCityCorners(state, actorId).length > 0;
+      const canSettle = actor.settlementsLeft > 0;
+      let score = 0;
+      if (canCity) score -= deficitForCost(remaining, COST_CITY) * 3.5;
+      if (canSettle) score -= deficitForCost(remaining, COST_SETTLEMENT) * 2.5;
+      score -= deficitForCost(remaining, COST_DEV) * 1.5;
+      return score;
+    }
+    case "moveRobber": {
+      const hex = state.topology.hexes[action.hexIndex];
+      if (!hex) return -1e9;
+      let score = 0;
+      for (const corner of hex.cornerIndices) {
+        const ownerId = state.cornerOwner[corner];
+        if (!ownerId) continue;
+        const weight = state.cornerPiece[corner] === 2 ? 2 : 1;
+        if (ownerId === actorId) score -= 40 * weight;
+        else score += hex.pips * weight * 3;
+      }
+      if (action.victimId) {
+        const victim = state.players.find((player) => player.id === action.victimId);
+        if (victim) score += 8 + victim.visibleVp * 1.5;
+      }
+      return score;
+    }
+    case "placeFreeRoad":
+    case "buildRoad": {
+      const reach = minAdditionalRoadsToOpenSettlementFromEdge(state, actorId, action.edgeIndex, 3);
+      const nextEdgeOwner = [...state.edgeOwner];
+      nextEdgeOwner[action.edgeIndex] = actorId;
+      const lengthGain = Math.max(0, computeRoadLengthOnTopology(state.topology, state.cornerOwner, nextEdgeOwner, actorId) - actor.roadLength);
+      const base = (4 - Math.min(4, reach.dist)) * 6 + reach.bestCornerScore * 0.25 + lengthGain * (action.type === "buildRoad" ? 4 : 2.5);
+      return raceScore(state, actorId, reach, base, lengthGain > 0).score;
+    }
+    case "playYearOfPlenty": {
+      const hyp: ResourceHand = { ...actor.hand };
+      for (const resource of action.resources) hyp[resource] += 1;
+      const canCity = actor.citiesLeft > 0 && getLegalCityCorners(state, actor.id).length > 0;
+      const canSettle = actor.settlementsLeft > 0 && getLegalSettlementCorners(state, actor.id).length > 0;
+      let score = 0;
+      if (canCity && deficitForCost(hyp, COST_CITY) === 0) score += 50;
+      else if (canCity) score -= deficitForCost(hyp, COST_CITY) * 4;
+      if (canSettle && deficitForCost(hyp, COST_SETTLEMENT) === 0) score += 40;
+      else if (canSettle) score -= deficitForCost(hyp, COST_SETTLEMENT) * 3;
+      if (deficitForCost(hyp, COST_DEV) === 0) score += 15;
+      if (deficitForCost(hyp, COST_ROAD) === 0 && actor.roadsLeft > 0) score += 8;
+      for (const resource of action.resources) score += RES_BASE_WEIGHT[resource];
+      return score;
+    }
+    case "playMonopoly": {
+      let score = RES_BASE_WEIGHT[action.resource] * 3;
+      for (let corner = 0; corner < state.topology.corners.length; corner++) {
+        const owner = state.cornerOwner[corner];
+        if (!owner || owner === actorId) continue;
+        const weight = state.cornerPiece[corner] === 2 ? 2 : 1;
+        for (const hexIndex of state.topology.corners[corner].hexIndices) {
+          const hex = state.topology.hexes[hexIndex];
+          if (hex.resource === action.resource && hex.pips > 0) score += hex.pips * weight * 2;
+        }
+      }
+      return score;
+    }
+    case "buildCity":
+      return 3000 + scoreCornerForPlayer(state, action.cornerIndex, actorId);
+    case "buildSettlement":
+      return 2500 + scoreCornerForPlayer(state, action.cornerIndex, actorId);
+    case "playRoadBuilding":
+      return 2000;
+    case "bankTrade": {
+      if (context.bankTradesThisTurn >= 4) return -100;
+      const after: ResourceHand = { ...actor.hand };
+      after[action.give] -= action.giveCount ?? 4;
+      after[action.receive] += action.receiveCount ?? 1;
+      return (
+        -deficitForCost(after, COST_CITY) * 4 -
+        deficitForCost(after, COST_SETTLEMENT) * 3 -
+        deficitForCost(after, COST_ROAD) +
+        RES_BASE_WEIGHT[action.receive]
+      );
+    }
+    case "buyDevCard": {
+      const canCity = actor.citiesLeft > 0 && getLegalCityCorners(state, actorId).length > 0;
+      const almostCity = canCity && actor.hand.grain >= 2 && actor.hand.ore >= 2;
+      return almostCity && sumHand(actor.hand) <= state.rules.cardDiscardLimit ? 40 : 400;
+    }
+    case "endTurn":
+      return 100;
+    default:
+      return 0;
+  }
+}
+
 /**
  * Simple, documented, deterministic-under-seed baseline rollout policy.
  *
